@@ -60,11 +60,13 @@ if __name__ == "__main__":
         "crossfade_length",
         "extra_time",
     }
-    # (block_time, crossfade_length, extra_time, f0method)
+    # (block_time, crossfade_length, extra_time, f0method, hubert_context)
+    # hubert_context is how many seconds HuBERT re-encodes per block; 0 means
+    # the whole window every time (slowest, marginally closer to offline).
     PRESETS = {
-        "preset_fast": (0.10, 0.04, 1.5, "fcpe"),
-        "preset_balanced": (0.25, 0.05, 2.5, "rmvpe"),
-        "preset_quality": (0.50, 0.08, 3.0, "rmvpe"),
+        "preset_fast": (0.10, 0.04, 1.5, "fcpe", 0.5),
+        "preset_balanced": (0.24, 0.05, 2.5, "rmvpe", 1.0),
+        "preset_quality": (0.50, 0.08, 3.0, "rmvpe", 0.0),
     }
     DEFAULTS = {
         "pth_path": "",
@@ -83,6 +85,7 @@ if __name__ == "__main__":
         "block_time": 0.25,
         "crossfade_length": 0.05,
         "extra_time": 2.5,
+        "hubert_context": 1.0,
         "f0method": "rmvpe",
         "I_noise_reduce": False,
         "O_noise_reduce": False,
@@ -175,6 +178,7 @@ if __name__ == "__main__":
 
         def launcher(self):
             data = self.load()
+            self.gui_config.hubert_context = float(data["hubert_context"])
             sg.theme("SystemDefaultForReal")
             if sys.platform == "win32":
                 sg.set_options(font=("Microsoft YaHei UI", 10))
@@ -448,6 +452,7 @@ if __name__ == "__main__":
 
         def collect_settings(self, values):
             settings = {key: values[key] for key in DEFAULTS if key in values}
+            settings["hubert_context"] = self.gui_config.hubert_context
             settings["sr_type"] = "sr_model" if values["sr_model"] else "sr_device"
             settings["f0method"] = next(
                 (name for name in F0_METHODS if values[name]), "rmvpe"
@@ -534,7 +539,10 @@ if __name__ == "__main__":
                     else:
                         self.set_status(i18n("没有找到与该模型匹配的索引"), COLOR_WARN)
                 elif event in PRESETS:
-                    block_time, crossfade, extra_time, f0method = PRESETS[event]
+                    block_time, crossfade, extra_time, f0method, context = PRESETS[
+                        event
+                    ]
+                    self.gui_config.hubert_context = context
                     self.window["block_time"].update(block_time)
                     self.window["crossfade_length"].update(crossfade)
                     self.window["extra_time"].update(extra_time)

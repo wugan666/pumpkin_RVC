@@ -16,6 +16,9 @@ from tools.cuda_graph import run_cuda_graph
 
 i18n = I18nAuto()
 
+HUBERT_HOP = 320  # samples at 16 kHz between two HuBERT frames
+HUBERT_EDGE_FRAMES = 8  # left-edge frames of a partial window that are discarded
+
 
 def printt(strr, *args):
     if len(args) == 0:
@@ -107,6 +110,11 @@ class RVC:
         # Last voiced F0 (Hz, before transposition) seen by the extractor.
         self.last_voiced_f0 = 0.0
         self.infer_count = 0
+        # Seconds of audio re-encoded by HuBERT ahead of each new block; the
+        # rest of the window comes from the feature cache. 0 disables caching.
+        self.hubert_context = 1.0
+        self.feat_cache = None
+        self.feat_cache_key = None
 
         self.resample_kernel = {}
 
@@ -173,6 +181,7 @@ class RVC:
         self.cache_voiced.zero_()
         self.last_voiced_f0 = 0.0
         self.infer_count = 0
+        self.feat_cache = None
 
     def change_key(self, new_key):
         self.f0_up_key = new_key
@@ -274,6 +283,51 @@ class RVC:
         ).squeeze().detach().cpu().numpy()
         return self.finalize_f0(f0, f0_up_key)
 
+    def _hubert(self, wav):
+        if self.config.is_half:
+            wav = wav.half().view(1, -1)
+        else:
+            wav = wav.float().view(1, -1)
+        padding_mask = torch.BoolTensor(wav.shape).to(self.device).fill_(False)
+        return extract_hubert_features(
+            self.model, wav, self.version, padding_mask=padding_mask
+        )
+
+    def extract_features(self, input_wav, block_frame_16k):
+        """HuBERT features for the whole window, reusing earlier blocks.
+
+        The window slides by one block per call, so all but the newest frames
+        were already computed last time. Only the tail (``hubert_context``
+        seconds plus the new block) is run through HuBERT and spliced onto the
+        shifted cache. The frames that are actually synthesized always sit at
+        the right edge of that tail; the older ones only serve as context for
+        the synthesizer's text encoder.
+        """
+        samples = input_wav.shape[0]
+        hop = HUBERT_HOP
+        wanted = int(self.hubert_context * 16000) + block_frame_16k
+        # Start on the frame grid of the full window so both line up exactly.
+        start = max(0, (samples - wanted) // hop * hop)
+        reusable = (
+            self.hubert_context > 0
+            and self.feat_cache is not None
+            and self.feat_cache_key == (samples, block_frame_16k, self.version)
+            and block_frame_16k % hop == 0
+            and start > 0
+        )
+        if not reusable:
+            feats = self._hubert(input_wav)
+        else:
+            tail = self._hubert(input_wav[start:])
+            shift = block_frame_16k // hop
+            feats = torch.roll(self.feat_cache, -shift, dims=1)
+            # The first frames of the tail lack left context; keep the cache there.
+            at = start // hop + HUBERT_EDGE_FRAMES
+            feats[:, at:] = tail[:, HUBERT_EDGE_FRAMES:]
+        self.feat_cache = feats.clone()
+        self.feat_cache_key = (samples, block_frame_16k, self.version)
+        return feats
+
     def infer(
         self,
         input_wav,
@@ -286,17 +340,7 @@ class RVC:
         self.infer_count += 1
         t1 = ttime()
         with torch.no_grad():
-            if self.config.is_half:
-                feats = input_wav.half().view(1, -1)
-            else:
-                feats = input_wav.float().view(1, -1)
-            padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
-            feats = extract_hubert_features(
-                self.model,
-                feats,
-                self.version,
-                padding_mask=padding_mask,
-            )
+            feats = self.extract_features(input_wav, block_frame_16k)
             feats = torch.cat((feats, feats[:, -1:, :]), 1)
         t2 = ttime()
         feats0 = None

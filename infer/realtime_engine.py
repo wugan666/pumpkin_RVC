@@ -43,6 +43,8 @@ class RealtimeSettings:
         self.block_time = 0.25  # s
         self.crossfade_time = 0.05
         self.extra_time = 2.5
+        # Seconds HuBERT re-encodes per block (rest is cached); 0 = everything.
+        self.hubert_context = 1.0
         self.threhold = GATE_OFF_DB  # (live) noise gate threshold in dB
         self.I_noise_reduce = False  # (live)
         self.O_noise_reduce = False  # (live)
@@ -65,12 +67,15 @@ class RealtimeEngine:
     def __init__(self, rvc, settings, device, samplerate):
         self.rvc = rvc
         self.cfg = settings
+        rvc.hubert_context = settings.hubert_context
         self.device = device
         self.samplerate = int(samplerate)
         cfg = settings
 
         self.zc = self.samplerate // 100
-        self.block_frame = self._frames(cfg.block_time)
+        # Blocks are a whole number of 20 ms HuBERT frames so that features
+        # computed for earlier blocks stay aligned and can be reused.
+        self.block_frame = max(1, round(cfg.block_time * 50)) * 2 * self.zc
         self.block_frame_16k = 160 * self.block_frame // self.zc
         self.crossfade_frame = self._frames(cfg.crossfade_time)
         self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
@@ -437,6 +442,13 @@ def main():
     parser.add_argument("--block-time", type=float, default=0.25)
     parser.add_argument("--crossfade-time", type=float, default=0.05)
     parser.add_argument("--extra-time", type=float, default=2.5)
+    parser.add_argument(
+        "--hubert-context",
+        type=float,
+        default=None,
+        help="seconds re-encoded per block; 0 re-encodes the whole window",
+    )
+    parser.add_argument("--seed", type=int, default=None, help="fixed sampling noise")
     parser.add_argument("--input-denoise", action="store_true")
     parser.add_argument("--output-denoise", action="store_true")
     args = parser.parse_args()
@@ -472,8 +484,12 @@ def main():
         config,
         protect=cfg.protect,
     )
+    if args.hubert_context is not None:
+        cfg.hubert_context = args.hubert_context
     engine = RealtimeEngine(rvc, cfg, config.device, rvc.tgt_sr)
     engine.prewarm()
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
     audio, _ = librosa.load(args.input, sr=engine.samplerate, mono=True)
     times = []
     out = simulate_file(engine, audio.astype(np.float32), times)
