@@ -37,7 +37,14 @@ AUTO_GATE_MIN_HOPS = 100  # history needed before the estimate is used
 
 # Loudness matching may not boost the model output by more than this factor.
 MAX_ENVELOPE_GAIN = 6.0
+# Output limiter: peaks are held under the ceiling by turning the gain down
+# smoothly (no distortion); the soft clipper above the knee is only a last
+# safety net for what slips through.
+LIMITER_CEILING = 0.7  # about -3 dBFS
+LIMITER_RELEASE_HOPS = 20  # gain recovers over 200 ms
 LIMITER_KNEE = 0.85
+# The input is considered clipped by the microphone above this level.
+INPUT_CLIP_LEVEL = 0.985
 
 
 class RealtimeSettings:
@@ -155,6 +162,7 @@ class RealtimeEngine:
         self.gate_hold = 0
         self.level_history = np.zeros(0, dtype=np.float32)
         self.auto_threshold_db = None
+        self.limiter_gain = 1.0
         # Gain at the end of each of the most recent hops (oldest first).
         self.gate_history = np.zeros(GATE_PREROLL_HOPS + 1, dtype=np.float32)
         # Read by the GUI thread; plain values so no locking is needed.
@@ -170,6 +178,9 @@ class RealtimeEngine:
             "threshold": None,  # gate threshold in use when it is automatic
             "idle": False,  # True while the gate is closed and models are skipped
             "idle_blocks": 0,
+            "input_clipped": 0,  # blocks in which the microphone signal clipped
+            "limited_db": 0.0,  # gain reduction applied by the output limiter
+            "glitches": 0,  # blocks muted because the model produced NaN/inf
         }
 
     def _frames(self, seconds):
@@ -198,6 +209,7 @@ class RealtimeEngine:
         self.gate_history[:] = 0
         self.level_history = np.zeros(0, dtype=np.float32)
         self.auto_threshold_db = None
+        self.limiter_gain = 1.0
         self.rvc.reset_state()
 
     def prewarm(self):
@@ -316,6 +328,33 @@ class RealtimeEngine:
             return fallback if fallback > GATE_OFF_DB else AUTO_GATE_RANGE_DB[0]
         return self.auto_threshold_db
 
+    def _limit(self, wav):
+        """Peak limiter. ``wav`` is this block followed by the crossfade tail
+        (the start of the next block), which serves as look-ahead so the gain
+        is already down when a peak arrives; returns the limited block.
+
+        Without it a shout or a hit on the desk leaves the sound card far
+        above full scale and is hard-clipped there.
+        """
+        zc = self.zc
+        hops = wav.shape[0] // zc
+        peaks = wav[: hops * zc].abs().view(hops, zc).amax(dim=1).cpu().numpy()
+        need = np.minimum(1.0, LIMITER_CEILING / (peaks + 1e-9))
+        # Each hop also honours the next one, so its ramp ends low enough.
+        need = np.minimum(need, np.append(need[1:], need[-1]))
+        gains = np.empty(hops + 1, dtype=np.float32)
+        gains[0] = gain = self.limiter_gain
+        for i in range(hops):
+            gain = min(need[i], gain + 1.0 / LIMITER_RELEASE_HOPS)
+            gains[i + 1] = gain
+        block_hops = self.block_frame // zc
+        self.limiter_gain = float(gains[block_hops])
+        self.stats["limited_db"] = float(-20 * np.log10(gains[1 : block_hops + 1].min()))
+        ramp = np.interp(
+            np.arange(self.block_frame) / zc, np.arange(hops + 1), gains
+        ).astype(np.float32)
+        return wav[: self.block_frame] * torch.from_numpy(ramp).to(wav.device)
+
     def _rms(self, wav):
         """Frame RMS matching librosa.feature.rms(frame=4*zc, hop=zc)."""
         frame = 4 * self.zc
@@ -349,9 +388,15 @@ class RealtimeEngine:
         cfg = self.cfg
         block = self.block_frame
         converting = cfg.function == "vc"
-        indata = np.asarray(indata, dtype=np.float32)
+        # A driver hiccup can deliver NaN or wildly out-of-range samples.
+        indata = np.nan_to_num(
+            np.asarray(indata, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
         peak = float(np.max(np.abs(indata))) if indata.size else 0.0
         self.stats["input_db"] = 20 * np.log10(peak + 1e-6)
+        if peak >= INPUT_CLIP_LEVEL:
+            self.stats["input_clipped"] += 1
+            indata = np.clip(indata, -1.0, 1.0)
 
         indata, envelope = self._gate(indata)
         self.input_wav[:-block] = self.input_wav[block:].clone()
@@ -413,6 +458,13 @@ class RealtimeEngine:
             self.rvc.auto_pitch = bool(cfg.auto_pitch)
             infer_wav = self._convert()
             self.stats["auto_key"] = self.rvc.auto_key if cfg.auto_pitch else None
+            # Half precision can overflow on extreme input. One bad value would
+            # otherwise be played as a full-scale burst and, through the pitch
+            # and feature caches, poison the following seconds as well.
+            if not bool(torch.isfinite(infer_wav).all()):
+                self.stats["glitches"] += 1
+                self.rvc.reset_state()
+                infer_wav = torch.zeros_like(infer_wav)
         else:
             infer_wav = source.clone()
         # output noise reduction
@@ -455,7 +507,10 @@ class RealtimeEngine:
         infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
         infer_wav[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
         self.sola_buffer[:] = infer_wav[block : block + self.sola_buffer_frame]
-        out = soft_limit(infer_wav[:block]).cpu().numpy()
+        out = soft_limit(
+            self._limit(infer_wav[: block + self.sola_buffer_frame])
+        )
+        out = out.cpu().numpy()
 
         total = time.perf_counter() - start_time
         stats = self.stats
@@ -607,7 +662,7 @@ def main():
     audio, _ = librosa.load(args.input, sr=engine.samplerate, mono=True)
     times = []
     out = simulate_file(engine, audio.astype(np.float32), times)
-    sf.write(args.output, out, engine.samplerate)
+    sf.write(args.output, out, engine.samplerate, subtype="FLOAT")
     if args.auto_pitch:
         print("auto pitch: %s (model median F0: %s)" % (rvc.auto_key, rvc.f0_median))
     block_ms = 1000 * engine.block_frame / engine.samplerate

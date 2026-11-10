@@ -177,6 +177,7 @@ if __name__ == "__main__":
             self.overrun_time = float("-inf")
             self.auto_block = True
             self.shown_threshold = None
+            self.shown_input_clipped = 0
             self.notice = ""
             self.notice_time = float("-inf")
             self.overrun_marks = deque([(0.0, 0)])
@@ -589,6 +590,12 @@ if __name__ == "__main__":
                 self.shown_threshold = round(threshold)
                 self.window["threhold"].update(self.shown_threshold)
             now = time.monotonic()
+            # The limiter keeps the output clean, but a clipped microphone is
+            # already distorted before it gets here: tell the user to back off.
+            if stats["input_clipped"] > self.shown_input_clipped:
+                self.shown_input_clipped = stats["input_clipped"]
+                self.notice = i18n("麦克风输入过载（削波）：请调低麦克风音量或离麦克风远一点")
+                self.notice_time = now
             if stats["overruns"] > self.shown_overruns:
                 self.shown_overruns = stats["overruns"]
                 self.overrun_time = now
@@ -644,6 +651,7 @@ if __name__ == "__main__":
             return True
 
         def reset_run_state(self):
+            self.shown_input_clipped = 0
             self.shown_overruns = 0
             self.overrun_time = float("-inf")
             self.overrun_marks = deque([(time.monotonic(), 0)])
