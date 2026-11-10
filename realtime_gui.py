@@ -38,7 +38,12 @@ if __name__ == "__main__":
 
     from configs.config import Config
     from infer import rtrvc as rvc_for_realtime
-    from infer.realtime_engine import RealtimeEngine, RealtimeSettings
+    from infer.realtime_engine import (
+        RealtimeEngine,
+        RealtimeSettings,
+        auto_block_engine,
+    )
+    from tools.download_models import download_assets, inference_assets
     from infer.vc.utils import get_index_path_from_model
     from i18n.i18n import I18nAuto
 
@@ -77,6 +82,9 @@ if __name__ == "__main__":
         "sg_output_device": "",
         "sr_type": "sr_model",
         "threhold": -55,
+        "auto_pitch": True,
+        "auto_block": True,
+        "show_advanced": False,
         "pitch": 0,
         "formant": 0.0,
         "index_rate": 0.3,
@@ -133,6 +141,9 @@ if __name__ == "__main__":
             self.engine = None
             self.shown_overruns = 0
             self.overrun_time = float("-inf")
+            self.auto_block = True
+            self.auto_pitch_unavailable = False
+            self.show_advanced = False
             self.update_devices()
             self.launcher()
 
@@ -197,8 +208,8 @@ if __name__ == "__main__":
                     expand_x=True,
                 )
 
-            model_frame = sg.Frame(
-                title=i18n("加载模型"),
+            quick_frame = sg.Frame(
+                title=i18n("快速开始"),
                 expand_x=True,
                 layout=[
                     [
@@ -218,46 +229,6 @@ if __name__ == "__main__":
                             file_types=(("pth", "*.pth"),),
                         ),
                         sg.Button(i18n("刷新"), key="refresh_models"),
-                    ],
-                    [
-                        label("索引(可选)"),
-                        sg.Input(
-                            default_text=data["index_path"],
-                            key="index_path",
-                            enable_events=True,
-                            size=(52, 1),
-                            expand_x=True,
-                        ),
-                        sg.FileBrowse(
-                            i18n("选择.index文件"),
-                            target="index_path",
-                            initial_folder=os.path.join(os.getcwd(), "logs"),
-                            file_types=(("index", "*.index"),),
-                        ),
-                        sg.Button(i18n("自动匹配"), key="match_index"),
-                    ],
-                ],
-            )
-            device_frame = sg.Frame(
-                title=i18n("音频设备"),
-                expand_x=True,
-                layout=[
-                    [
-                        label("设备类型"),
-                        sg.Combo(
-                            self.hostapis,
-                            key="sg_hostapi",
-                            default_value=data["sg_hostapi"],
-                            enable_events=True,
-                            size=(20, 1),
-                        ),
-                        sg.Checkbox(
-                            i18n("独占 WASAPI 设备"),
-                            key="sg_wasapi_exclusive",
-                            default=data["sg_wasapi_exclusive"],
-                            enable_events=True,
-                        ),
-                        sg.Button(i18n("重载设备列表"), key="reload_devices"),
                     ],
                     [
                         label("输入设备"),
@@ -280,6 +251,56 @@ if __name__ == "__main__":
                             size=(52, 1),
                             expand_x=True,
                         ),
+                    ],
+                    [
+                        label("音调设置"),
+                        sg.Checkbox(
+                            i18n("自动变调"),
+                            key="auto_pitch",
+                            default=data["auto_pitch"],
+                            enable_events=True,
+                        ),
+                        slider("pitch", (-24, 24), 1),
+                    ],
+                ],
+            )
+            model_frame = sg.Frame(
+                title=i18n("索引与设备"),
+                expand_x=True,
+                layout=[
+                    [
+                        label("索引(可选)"),
+                        sg.Input(
+                            default_text=data["index_path"],
+                            key="index_path",
+                            enable_events=True,
+                            size=(52, 1),
+                            expand_x=True,
+                        ),
+                        sg.FileBrowse(
+                            i18n("选择.index文件"),
+                            target="index_path",
+                            initial_folder=os.path.join(os.getcwd(), "logs"),
+                            file_types=(("index", "*.index"),),
+                        ),
+                        sg.Button(i18n("自动匹配"), key="match_index"),
+                    ],
+                    [
+                        label("设备类型"),
+                        sg.Combo(
+                            self.hostapis,
+                            key="sg_hostapi",
+                            default_value=data["sg_hostapi"],
+                            enable_events=True,
+                            size=(20, 1),
+                        ),
+                        sg.Checkbox(
+                            i18n("独占 WASAPI 设备"),
+                            key="sg_wasapi_exclusive",
+                            default=data["sg_wasapi_exclusive"],
+                            enable_events=True,
+                        ),
+                        sg.Button(i18n("重载设备列表"), key="reload_devices"),
                     ],
                     [
                         label("采样率"),
@@ -307,7 +328,6 @@ if __name__ == "__main__":
                 expand_y=True,
                 layout=[
                     [label("响应阈值"), slider("threhold", (-60, 0), 1)],
-                    [label("音调设置"), slider("pitch", (-16, 16), 1)],
                     [label("性别因子/声线粗细"), slider("formant", (-2, 2), 0.05)],
                     [label("Index Rate"), slider("index_rate", (0.0, 1.0), 0.01)],
                     [label("清辅音保护"), slider("protect", (0.0, 0.5), 0.01)],
@@ -338,6 +358,14 @@ if __name__ == "__main__":
                         sg.Button(i18n("均衡"), key="preset_balanced"),
                         sg.Button(i18n("高音质"), key="preset_quality"),
                     ],
+                    [
+                        sg.Checkbox(
+                            i18n("自动选择采样长度（启动时实测本机速度）"),
+                            key="auto_block",
+                            default=data["auto_block"],
+                            enable_events=True,
+                        )
+                    ],
                     [label("采样长度"), slider("block_time", (0.02, 1.5), 0.01)],
                     [
                         label("淡入淡出长度"),
@@ -357,15 +385,6 @@ if __name__ == "__main__":
                             default=data["O_noise_reduce"],
                             enable_events=True,
                         ),
-                    ],
-                    [
-                        sg.Text(
-                            i18n(
-                                "推理时间必须小于采样长度，否则声音会断续；出现过载时请加大采样长度或改用fcpe。"
-                            ),
-                            size=(46, 3),
-                            text_color=COLOR_IDLE,
-                        )
                     ],
                 ],
             )
@@ -427,18 +446,31 @@ if __name__ == "__main__":
                     ],
                 ],
             )
+            # Everything a first-time user needs is above the fold; the rest
+            # has working defaults and stays folded away.
+            advanced = sg.Column(
+                [[model_frame], [voice_frame, perf_frame]],
+                key="advanced",
+                visible=bool(data["show_advanced"]),
+                expand_x=True,
+                pad=(0, 0),
+            )
             layout = [
-                [model_frame],
-                [device_frame],
-                [voice_frame, perf_frame],
+                [quick_frame],
                 [status_frame],
+                [sg.Button(self.advanced_label(data["show_advanced"]), key="toggle_advanced")],
+                [sg.pin(advanced, expand_x=True)],
             ]
+            self.show_advanced = bool(data["show_advanced"])
             self.window = sg.Window(
                 i18n("RVC 实时变声"), layout=layout, finalize=True, resizable=True
             )
             self.event_handler()
 
         # ----------------------------------------------------------- events
+
+        def advanced_label(self, shown):
+            return i18n("收起高级设置 ▲") if shown else i18n("高级设置 ▼")
 
         def set_status(self, text, color=COLOR_IDLE):
             self.window["status"].update(text, text_color=color)
@@ -453,6 +485,7 @@ if __name__ == "__main__":
         def collect_settings(self, values):
             settings = {key: values[key] for key in DEFAULTS if key in values}
             settings["hubert_context"] = self.gui_config.hubert_context
+            settings["show_advanced"] = self.show_advanced
             settings["sr_type"] = "sr_model" if values["sr_model"] else "sr_device"
             settings["f0method"] = next(
                 (name for name in F0_METHODS if values[name]), "rmvpe"
@@ -475,6 +508,10 @@ if __name__ == "__main__":
             self.window["input_meter"].update(int(max(0, stats["input_db"] + 60)))
             self.window["output_meter"].update(int(max(0, stats["output_db"] + 60)))
             self.window["overruns"].update(stats["overruns"])
+            auto_key = stats["auto_key"]
+            if auto_key is not None and auto_key != self.gui_config.pitch:
+                self.gui_config.pitch = auto_key
+                self.window["pitch"].update(auto_key)
             if stats["overruns"] > self.shown_overruns:
                 self.shown_overruns = stats["overruns"]
                 self.overrun_time = time.monotonic()
@@ -485,6 +522,10 @@ if __name__ == "__main__":
                 )
             elif not stats["gate_open"]:
                 self.set_status(i18n("运行中 · 静音(低于响应阈值)"), COLOR_WARN)
+            elif self.auto_pitch_unavailable and self.gui_config.auto_pitch:
+                self.set_status(
+                    i18n("运行中 · 该模型没有音高统计，请手动设置音调"), COLOR_WARN
+                )
             else:
                 self.set_status(i18n("运行中"), COLOR_OK)
 
@@ -584,10 +625,27 @@ if __name__ == "__main__":
                 # Parameter hot update
                 elif event == "threhold":
                     self.gui_config.threhold = values["threhold"]
+                elif event == "toggle_advanced":
+                    self.show_advanced = not self.show_advanced
+                    self.window["advanced"].update(visible=self.show_advanced)
+                    self.window["toggle_advanced"].update(
+                        self.advanced_label(self.show_advanced)
+                    )
                 elif event == "pitch":
+                    # Moving the slider by hand takes over from auto pitch.
                     self.gui_config.pitch = values["pitch"]
+                    self.gui_config.auto_pitch = False
+                    self.window["auto_pitch"].update(False)
                     if hasattr(self, "rvc"):
+                        self.rvc.auto_pitch = False
                         self.rvc.change_key(values["pitch"])
+                elif event == "auto_pitch":
+                    self.gui_config.auto_pitch = values["auto_pitch"]
+                    if values["auto_pitch"] and hasattr(self, "rvc"):
+                        self.rvc.auto_pitch_locked = False
+                        self.rvc.source_f0.clear()
+                elif event == "auto_block":
+                    pass  # read when the conversion starts
                 elif event == "formant":
                     self.gui_config.formant = values["formant"]
                     if hasattr(self, "rvc"):
@@ -650,6 +708,8 @@ if __name__ == "__main__":
             cfg.sr_type = settings["sr_type"]
             cfg.threhold = values["threhold"]
             cfg.pitch = values["pitch"]
+            cfg.auto_pitch = values["auto_pitch"]
+            self.auto_block = values["auto_block"]
             cfg.formant = values["formant"]
             cfg.block_time = values["block_time"]
             cfg.crossfade_time = values["crossfade_length"]
@@ -663,9 +723,17 @@ if __name__ == "__main__":
             cfg.function = "vc" if values["vc"] else "im"
             return True
 
+        def ensure_base_models(self):
+            """Fetch HuBERT / RMVPE on first use instead of failing to start."""
+            for line in download_assets(inference_assets()):
+                printt(line)
+                self.set_status(line[:70], COLOR_WARN)
+                self.window.refresh()
+
         def start_vc(self):
             torch.cuda.empty_cache()
             cfg = self.gui_config
+            self.ensure_base_models()
             self.rvc = rvc_for_realtime.RVC(
                 cfg.pitch,
                 cfg.formant,
@@ -682,11 +750,22 @@ if __name__ == "__main__":
                 else self.get_device_samplerate()
             )
             cfg.channels = self.get_device_channels()
-            self.engine = RealtimeEngine(
-                self.rvc, cfg, self.config.device, cfg.samplerate
-            )
+            if cfg.auto_pitch and not self.rvc.f0_median:
+                self.auto_pitch_unavailable = True
             printt(i18n("正在预热模型"))
-            self.engine.prewarm()
+            if self.auto_block:
+                self.set_status(i18n("正在测试本机速度…"), COLOR_WARN)
+                self.window.refresh()
+                self.engine, block_time, cost = auto_block_engine(
+                    self.rvc, cfg, self.config.device, cfg.samplerate
+                )
+                printt("auto block: %.2fs (%.0f ms per block)", block_time, cost)
+                self.window["block_time"].update(block_time)
+            else:
+                self.engine = RealtimeEngine(
+                    self.rvc, cfg, self.config.device, cfg.samplerate
+                )
+                self.engine.prewarm()
             self.start_stream()
 
         def start_stream(self):

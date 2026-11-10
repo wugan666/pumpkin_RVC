@@ -407,6 +407,36 @@ class RealtimeEngine:
         return out
 
 
+# Block lengths tried by auto_block_engine, shortest (lowest latency) first.
+AUTO_BLOCK_TIMES = (0.1, 0.14, 0.2, 0.24, 0.32, 0.4, 0.5, 0.7, 1.0)
+
+
+def auto_block_engine(rvc, settings, device, samplerate, headroom=0.7):
+    """Build an engine with the shortest block this machine can sustain.
+
+    Each candidate is timed on a synthetic voice-like signal; the first whose
+    processing time stays under ``headroom`` of the block length wins. Returns
+    ``(engine, block_time, milliseconds_per_block)`` and leaves the choice in
+    ``settings.block_time``. When nothing fits, the longest block is used.
+    """
+    engine = cost = None
+    for block_time in AUTO_BLOCK_TIMES:
+        settings.block_time = block_time
+        engine = RealtimeEngine(rvc, settings, device, samplerate)
+        engine.prewarm()  # also absorbs one-off costs (lazy loads, graph capture)
+        t = np.arange(engine.block_frame) / engine.samplerate
+        probe = (0.1 * np.sin(2 * np.pi * 160 * t)).astype(np.float32)
+        cost = 0.0
+        for _ in range(2):
+            engine.process(probe)
+            cost = max(cost, engine.stats["total_ms"])
+        engine.reset()
+        engine.stats.update(blocks=0, overruns=0)
+        if cost <= headroom * 1000 * engine.block_frame / engine.samplerate:
+            break
+    return engine, settings.block_time, cost
+
+
 def simulate_file(engine, audio, block_times=None):
     """Feed ``audio`` (mono float32 at engine.samplerate) through the engine
     block by block, exactly as the sound card callback would. When given,
@@ -450,6 +480,9 @@ def main():
     parser.add_argument("--threshold", type=float, default=GATE_OFF_DB)
     parser.add_argument("--f0method", default="rmvpe", choices=("pm", "rmvpe", "fcpe"))
     parser.add_argument("--block-time", type=float, default=0.25)
+    parser.add_argument(
+        "--auto-block", action="store_true", help="pick the block length by timing"
+    )
     parser.add_argument("--crossfade-time", type=float, default=0.05)
     parser.add_argument("--extra-time", type=float, default=2.5)
     parser.add_argument(
@@ -497,8 +530,12 @@ def main():
     )
     if args.hubert_context is not None:
         cfg.hubert_context = args.hubert_context
-    engine = RealtimeEngine(rvc, cfg, config.device, rvc.tgt_sr)
-    engine.prewarm()
+    if args.auto_block:
+        engine, block_time, cost = auto_block_engine(rvc, cfg, config.device, rvc.tgt_sr)
+        print("auto block: %.2fs (%.0f ms per block)" % (block_time, cost))
+    else:
+        engine = RealtimeEngine(rvc, cfg, config.device, rvc.tgt_sr)
+        engine.prewarm()
     if args.seed is not None:
         torch.manual_seed(args.seed)
     audio, _ = librosa.load(args.input, sr=engine.samplerate, mono=True)

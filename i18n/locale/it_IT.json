@@ -347,5 +347,20 @@
     "准备训练素材": "Preparing the training material",
     "下载基础模型": "Downloading base models",
     "音色名称只能使用英文字母、数字、下划线和短横线（最长48个字符），例如 my_voice": "The voice name may only contain letters, digits, underscores and hyphens (max 48 characters), e.g. my_voice",
-    "请先上传人声音频、录一段音，或填写素材文件夹路径": "Upload voice recordings, record a clip, or enter a dataset folder path first"
+    "请先上传人声音频、录一段音，或填写素材文件夹路径": "Upload voice recordings, record a clip, or enter a dataset folder path first",
+    "完成后清理训练中间文件以节省硬盘（清理后不能继续训练该音色）": "Delete intermediate training files when done to save disk space (training cannot be resumed afterwards)",
+    "已清理训练中间文件": "Intermediate training files removed",
+    "检查素材质量": "Checking the material quality",
+    "快速开始": "Quick start",
+    "手动变调": "Manual transpose",
+    "收起高级设置 ▲": "Hide advanced settings ▲",
+    "高级设置 ▼": "Advanced settings ▼",
+    "正在测试本机速度…": "Measuring this machine's speed...",
+    "索引与设备": "Index and device",
+    "自动变调": "Auto pitch",
+    "自动变调（按音色自动匹配音高，适合说话；唱歌请关闭并手动按八度调）": "Auto pitch (matches the pitch to the voice; for speech. For singing turn it off and transpose by octaves)",
+    "自动变调（推荐，自动把你的音高对到该音色）": "Auto pitch (recommended: moves your pitch into this voice's range)",
+    "自动选择采样长度（启动时实测本机速度）": "Choose the sample length automatically (timed on this machine at start)",
+    "该模型没有音高统计，已使用手动变调": "this model has no pitch statistics; the manual transpose was used",
+    "运行中 · 该模型没有音高统计，请手动设置音调": "Running · this model has no pitch statistics, set the pitch manually"
 }
