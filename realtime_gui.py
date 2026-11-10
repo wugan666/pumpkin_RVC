@@ -6,6 +6,9 @@ now_dir = os.path.dirname(os.path.abspath(__file__))
 from tools.file_io import read_text
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("weight_root", "assets/weights")
+os.environ.setdefault("index_root", "logs")
+os.environ.setdefault("outside_index_root", "assets/indices")
 
 os.environ["OMP_NUM_THREADS"] = "4"
 
@@ -28,48 +31,95 @@ if __name__ == "__main__":
     import traceback
 
     import librosa
-    from tools.torchgate import TorchGate
     import numpy as np
     import FreeSimpleGUI as sg
     import sounddevice as sd
     import torch
-    import torch.nn.functional as F
-    import torchaudio.transforms as tat
 
     from configs.config import Config
     from infer import rtrvc as rvc_for_realtime
+    from infer.realtime_engine import RealtimeEngine, RealtimeSettings
+    from infer.vc.utils import get_index_path_from_model
     from i18n.i18n import I18nAuto
-    from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 
     i18n = I18nAuto()
 
-    class GUIConfig:
-        def __init__(self) :
+    F0_METHODS = ("pm", "rmvpe", "fcpe")
+    # Changing any of these needs new buffers or a new stream.
+    RESTART_KEYS = {
+        "pth_path",
+        "index_path",
+        "sg_hostapi",
+        "sg_wasapi_exclusive",
+        "sg_input_device",
+        "sg_output_device",
+        "reload_devices",
+        "sr_model",
+        "sr_device",
+        "block_time",
+        "crossfade_length",
+        "extra_time",
+    }
+    # (block_time, crossfade_length, extra_time, f0method)
+    PRESETS = {
+        "preset_fast": (0.10, 0.04, 1.5, "fcpe"),
+        "preset_balanced": (0.25, 0.05, 2.5, "rmvpe"),
+        "preset_quality": (0.50, 0.08, 3.0, "rmvpe"),
+    }
+    DEFAULTS = {
+        "pth_path": "",
+        "index_path": "",
+        "sg_hostapi": "",
+        "sg_wasapi_exclusive": False,
+        "sg_input_device": "",
+        "sg_output_device": "",
+        "sr_type": "sr_model",
+        "threhold": -55,
+        "pitch": 0,
+        "formant": 0.0,
+        "index_rate": 0.3,
+        "protect": 0.33,
+        "rms_mix_rate": 0.25,
+        "block_time": 0.25,
+        "crossfade_length": 0.05,
+        "extra_time": 2.5,
+        "f0method": "rmvpe",
+        "I_noise_reduce": False,
+        "O_noise_reduce": False,
+    }
+    COLOR_OK = "#1a7f37"
+    COLOR_WARN = "#b35900"
+    COLOR_BAD = "#c62828"
+    COLOR_IDLE = "#57606a"
+
+    def list_models():
+        root = os.environ["weight_root"]
+        if not os.path.isdir(root):
+            return []
+        return sorted(
+            os.path.join(root, name).replace("\\", "/")
+            for name in os.listdir(root)
+            if name.endswith(".pth")
+        )
+
+    class GUIConfig(RealtimeSettings):
+        def __init__(self):
+            super().__init__()
             self.pth_path = ""
             self.index_path = ""
-            self.pitch = 0
-            self.formant=0.0
             self.sr_type = "sr_model"
-            self.block_time = 0.25  # s
-            self.threhold = -60
-            self.crossfade_time = 0.05
-            self.extra_time = 2.5
-            self.I_noise_reduce = False
-            self.O_noise_reduce = False
-            self.rms_mix_rate = 0.0
-            self.index_rate = 0.0
-            self.f0method = "rmvpe"
             self.sg_hostapi = ""
             self.wasapi_exclusive = False
             self.sg_input_device = ""
             self.sg_output_device = ""
+            self.samplerate = 0
+            self.channels = 1
 
     class GUI:
-        def __init__(self) :
+        def __init__(self):
             self.gui_config = GUIConfig()
             self.config = Config()
             printt("RVC_CUDA_GRAPH=%s", os.environ.get("RVC_CUDA_GRAPH", "0"))
-            self.function = "vc"
             self.delay_time = 0
             self.hostapis = None
             self.input_devices = None
@@ -77,417 +127,454 @@ if __name__ == "__main__":
             self.input_devices_indices = None
             self.output_devices_indices = None
             self.stream = None
+            self.engine = None
+            self.shown_overruns = 0
+            self.overrun_time = float("-inf")
             self.update_devices()
             self.launcher()
 
+        def default_device(self, kind):
+            names = self.input_devices if kind == 0 else self.output_devices
+            indices = (
+                self.input_devices_indices if kind == 0 else self.output_devices_indices
+            )
+            if sd.default.device[kind] in indices:
+                return names[indices.index(sd.default.device[kind])]
+            return names[0] if names else ""
+
         def load(self):
+            data = dict(DEFAULTS)
             try:
-                data = json.loads(read_text(realtime_config_path))
-                data["sr_model"] = data["sr_type"] == "sr_model"
-                data["sr_device"] = data["sr_type"] == "sr_device"
-                if data.get("f0method") not in ("pm", "rmvpe", "fcpe"):
-                    data["f0method"] = "rmvpe"
-                data["pm"] = data["f0method"] == "pm"
-                data["rmvpe"] = data["f0method"] == "rmvpe"
-                data["fcpe"] = data["f0method"] == "fcpe"
-                if data["sg_hostapi"] in self.hostapis:
-                    self.update_devices(hostapi_name=data["sg_hostapi"])
-                    if (
-                        data["sg_input_device"] not in self.input_devices
-                        or data["sg_output_device"] not in self.output_devices
-                    ):
-                        self.update_devices()
-                        data["sg_hostapi"] = self.hostapis[0]
-                        data["sg_input_device"] = self.input_devices[
-                            self.input_devices_indices.index(sd.default.device[0])
-                        ]
-                        data["sg_output_device"] = self.output_devices[
-                            self.output_devices_indices.index(sd.default.device[1])
-                        ]
-                else:
-                    data["sg_hostapi"] = self.hostapis[0]
-                    data["sg_input_device"] = self.input_devices[
-                        self.input_devices_indices.index(sd.default.device[0])
-                    ]
-                    data["sg_output_device"] = self.output_devices[
-                        self.output_devices_indices.index(sd.default.device[1])
-                    ]
-            except:
-                with open(realtime_config_path, "w", encoding="utf8") as j:
-                    data = {
-                        "pth_path": "",
-                        "index_path": "",
-                        "sg_hostapi": self.hostapis[0],
-                        "sg_wasapi_exclusive": False,
-                        "sg_input_device": self.input_devices[
-                            self.input_devices_indices.index(sd.default.device[0])
-                        ],
-                        "sg_output_device": self.output_devices[
-                            self.output_devices_indices.index(sd.default.device[1])
-                        ],
-                        "sr_type": "sr_model",
-                        "threhold": -60,
-                        "pitch": 0,
-                        "formant": 0.0,
-                        "index_rate": 0,
-                        "rms_mix_rate": 0,
-                        "block_time": 0.25,
-                        "crossfade_length": 0.05,
-                        "extra_time": 2.5,
-                        "f0method": "rmvpe",
-                    }
-                    data["sr_model"] = data["sr_type"] == "sr_model"
-                    data["sr_device"] = data["sr_type"] == "sr_device"
-                    data["pm"] = data["f0method"] == "pm"
-                    data["rmvpe"] = data["f0method"] == "rmvpe"
-                    data["fcpe"] = data["f0method"] == "fcpe"
+                data.update(json.loads(read_text(realtime_config_path)))
+            except Exception:
+                pass  # first run or unreadable file: start from the defaults
+            if data.get("f0method") not in F0_METHODS:
+                data["f0method"] = "rmvpe"
+            if data.get("sr_type") not in ("sr_model", "sr_device"):
+                data["sr_type"] = "sr_model"
+            if data["sg_hostapi"] in self.hostapis:
+                self.update_devices(hostapi_name=data["sg_hostapi"])
+            if (
+                data["sg_hostapi"] not in self.hostapis
+                or data["sg_input_device"] not in self.input_devices
+                or data["sg_output_device"] not in self.output_devices
+            ):
+                self.update_devices()
+                data["sg_hostapi"] = self.hostapis[0] if self.hostapis else ""
+                data["sg_input_device"] = self.default_device(0)
+                data["sg_output_device"] = self.default_device(1)
+            # A remembered model that has since been moved or deleted would only
+            # produce an error on start; fall back to what is actually there.
+            models = list_models()
+            if not os.path.isfile(str(data["pth_path"])):
+                data["pth_path"] = models[0] if models else ""
+                data["index_path"] = ""
+            if not os.path.isfile(str(data["index_path"])):
+                data["index_path"] = get_index_path_from_model(data["pth_path"])
             return data
 
         def launcher(self):
             data = self.load()
-            sg.theme("LightBlue3")
+            sg.theme("SystemDefaultForReal")
+            if sys.platform == "win32":
+                sg.set_options(font=("Microsoft YaHei UI", 10))
+            sg.set_options(element_padding=(6, 4))
+            label = lambda text: sg.Text(i18n(text), size=(20, 1))
+
+            def slider(key, value_range, resolution):
+                return sg.Slider(
+                    range=value_range,
+                    key=key,
+                    resolution=resolution,
+                    orientation="h",
+                    default_value=data[key],
+                    enable_events=True,
+                    size=(28, 14),
+                    expand_x=True,
+                )
+
+            model_frame = sg.Frame(
+                title=i18n("加载模型"),
+                expand_x=True,
+                layout=[
+                    [
+                        label("音色模型"),
+                        sg.Combo(
+                            list_models(),
+                            default_value=data["pth_path"],
+                            key="pth_path",
+                            enable_events=True,
+                            size=(52, 1),
+                            expand_x=True,
+                        ),
+                        sg.FileBrowse(
+                            i18n("选择.pth文件"),
+                            target="pth_path",
+                            initial_folder=os.path.join(os.getcwd(), "assets/weights"),
+                            file_types=(("pth", "*.pth"),),
+                        ),
+                        sg.Button(i18n("刷新"), key="refresh_models"),
+                    ],
+                    [
+                        label("索引(可选)"),
+                        sg.Input(
+                            default_text=data["index_path"],
+                            key="index_path",
+                            enable_events=True,
+                            size=(52, 1),
+                            expand_x=True,
+                        ),
+                        sg.FileBrowse(
+                            i18n("选择.index文件"),
+                            target="index_path",
+                            initial_folder=os.path.join(os.getcwd(), "logs"),
+                            file_types=(("index", "*.index"),),
+                        ),
+                        sg.Button(i18n("自动匹配"), key="match_index"),
+                    ],
+                ],
+            )
+            device_frame = sg.Frame(
+                title=i18n("音频设备"),
+                expand_x=True,
+                layout=[
+                    [
+                        label("设备类型"),
+                        sg.Combo(
+                            self.hostapis,
+                            key="sg_hostapi",
+                            default_value=data["sg_hostapi"],
+                            enable_events=True,
+                            size=(20, 1),
+                        ),
+                        sg.Checkbox(
+                            i18n("独占 WASAPI 设备"),
+                            key="sg_wasapi_exclusive",
+                            default=data["sg_wasapi_exclusive"],
+                            enable_events=True,
+                        ),
+                        sg.Button(i18n("重载设备列表"), key="reload_devices"),
+                    ],
+                    [
+                        label("输入设备"),
+                        sg.Combo(
+                            self.input_devices,
+                            key="sg_input_device",
+                            default_value=data["sg_input_device"],
+                            enable_events=True,
+                            size=(52, 1),
+                            expand_x=True,
+                        ),
+                    ],
+                    [
+                        label("输出设备"),
+                        sg.Combo(
+                            self.output_devices,
+                            key="sg_output_device",
+                            default_value=data["sg_output_device"],
+                            enable_events=True,
+                            size=(52, 1),
+                            expand_x=True,
+                        ),
+                    ],
+                    [
+                        label("采样率"),
+                        sg.Radio(
+                            i18n("使用模型采样率"),
+                            "sr_type",
+                            key="sr_model",
+                            default=data["sr_type"] == "sr_model",
+                            enable_events=True,
+                        ),
+                        sg.Radio(
+                            i18n("使用设备采样率"),
+                            "sr_type",
+                            key="sr_device",
+                            default=data["sr_type"] == "sr_device",
+                            enable_events=True,
+                        ),
+                        sg.Text("", key="sr_stream", size=(8, 1)),
+                    ],
+                ],
+            )
+            voice_frame = sg.Frame(
+                title=i18n("常规设置"),
+                expand_x=True,
+                expand_y=True,
+                layout=[
+                    [label("响应阈值"), slider("threhold", (-60, 0), 1)],
+                    [label("音调设置"), slider("pitch", (-16, 16), 1)],
+                    [label("性别因子/声线粗细"), slider("formant", (-2, 2), 0.05)],
+                    [label("Index Rate"), slider("index_rate", (0.0, 1.0), 0.01)],
+                    [label("清辅音保护"), slider("protect", (0.0, 0.5), 0.01)],
+                    [label("响度因子"), slider("rms_mix_rate", (0.0, 1.0), 0.01)],
+                    [
+                        label("音高算法"),
+                        *[
+                            sg.Radio(
+                                name,
+                                "f0method",
+                                key=name,
+                                default=data["f0method"] == name,
+                                enable_events=True,
+                            )
+                            for name in F0_METHODS
+                        ],
+                    ],
+                ],
+            )
+            perf_frame = sg.Frame(
+                title=i18n("性能设置"),
+                expand_x=True,
+                expand_y=True,
+                layout=[
+                    [
+                        label("预设"),
+                        sg.Button(i18n("低延迟"), key="preset_fast"),
+                        sg.Button(i18n("均衡"), key="preset_balanced"),
+                        sg.Button(i18n("高音质"), key="preset_quality"),
+                    ],
+                    [label("采样长度"), slider("block_time", (0.02, 1.5), 0.01)],
+                    [
+                        label("淡入淡出长度"),
+                        slider("crossfade_length", (0.01, 0.15), 0.01),
+                    ],
+                    [label("额外推理时长"), slider("extra_time", (0.05, 5.00), 0.01)],
+                    [
+                        sg.Checkbox(
+                            i18n("输入降噪"),
+                            key="I_noise_reduce",
+                            default=data["I_noise_reduce"],
+                            enable_events=True,
+                        ),
+                        sg.Checkbox(
+                            i18n("输出降噪"),
+                            key="O_noise_reduce",
+                            default=data["O_noise_reduce"],
+                            enable_events=True,
+                        ),
+                    ],
+                    [
+                        sg.Text(
+                            i18n(
+                                "推理时间必须小于采样长度，否则声音会断续；出现过载时请加大采样长度或改用fcpe。"
+                            ),
+                            size=(46, 3),
+                            text_color=COLOR_IDLE,
+                        )
+                    ],
+                ],
+            )
+            meter = lambda key: sg.ProgressBar(
+                60, orientation="h", size=(18, 12), key=key, expand_x=True
+            )
+            status_frame = sg.Frame(
+                title=i18n("运行状态"),
+                expand_x=True,
+                layout=[
+                    [
+                        sg.Button(
+                            i18n("开始音频转换"),
+                            key="start_vc",
+                            button_color=("white", COLOR_OK),
+                        ),
+                        sg.Button(
+                            i18n("停止音频转换"),
+                            key="stop_vc",
+                            disabled=True,
+                        ),
+                        sg.Radio(
+                            i18n("输入监听"),
+                            "function",
+                            key="im",
+                            default=False,
+                            enable_events=True,
+                        ),
+                        sg.Radio(
+                            i18n("输出变声"),
+                            "function",
+                            key="vc",
+                            default=True,
+                            enable_events=True,
+                        ),
+                    ],
+                    [
+                        sg.Text(
+                            i18n("未启动"),
+                            key="status",
+                            size=(70, 1),
+                            text_color=COLOR_IDLE,
+                            expand_x=True,
+                        ),
+                    ],
+                    [
+                        sg.Text(i18n("输入电平")),
+                        meter("input_meter"),
+                        sg.Text(i18n("输出电平")),
+                        meter("output_meter"),
+                    ],
+                    [
+                        sg.Text(i18n("算法延迟(ms):")),
+                        sg.Text("0", key="delay_time", size=(5, 1)),
+                        sg.Text(i18n("推理时间(ms):")),
+                        sg.Text("0", key="infer_time", size=(5, 1)),
+                        sg.Text(i18n("过载次数:")),
+                        sg.Text("0", key="overruns", size=(6, 1)),
+                    ],
+                ],
+            )
             layout = [
-                [
-                    sg.Frame(
-                        title=i18n("加载模型"),
-                        layout=[
-                            [
-                                sg.Input(
-                                    default_text=data.get("pth_path", ""),
-                                    key="pth_path",
-                                ),
-                                sg.FileBrowse(
-                                    i18n("选择.pth文件"),
-                                    initial_folder=os.path.join(
-                                        os.getcwd(), "assets/weights"
-                                    ),
-                                    file_types=((". pth"),),
-                                ),
-                            ],
-                            [
-                                sg.Input(
-                                    default_text=data.get("index_path", ""),
-                                    key="index_path",
-                                ),
-                                sg.FileBrowse(
-                                    i18n("选择.index文件"),
-                                    initial_folder=os.path.join(os.getcwd(), "logs"),
-                                    file_types=((". index"),),
-                                ),
-                            ],
-                        ],
-                    )
-                ],
-                [
-                    sg.Frame(
-                        layout=[
-                            [
-                                sg.Text(i18n("设备类型")),
-                                sg.Combo(
-                                    self.hostapis,
-                                    key="sg_hostapi",
-                                    default_value=data.get("sg_hostapi", ""),
-                                    enable_events=True,
-                                    size=(20, 1),
-                                ),
-                                sg.Checkbox(
-                                    i18n("独占 WASAPI 设备"),
-                                    key="sg_wasapi_exclusive",
-                                    default=data.get("sg_wasapi_exclusive", False),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("输入设备")),
-                                sg.Combo(
-                                    self.input_devices,
-                                    key="sg_input_device",
-                                    default_value=data.get("sg_input_device", ""),
-                                    enable_events=True,
-                                    size=(45, 1),
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("输出设备")),
-                                sg.Combo(
-                                    self.output_devices,
-                                    key="sg_output_device",
-                                    default_value=data.get("sg_output_device", ""),
-                                    enable_events=True,
-                                    size=(45, 1),
-                                ),
-                            ],
-                            [
-                                sg.Button(i18n("重载设备列表"), key="reload_devices"),
-                                sg.Radio(
-                                    i18n("使用模型采样率"),
-                                    "sr_type",
-                                    key="sr_model",
-                                    default=data.get("sr_model", True),
-                                    enable_events=True,
-                                ),
-                                sg.Radio(
-                                    i18n("使用设备采样率"),
-                                    "sr_type",
-                                    key="sr_device",
-                                    default=data.get("sr_device", False),
-                                    enable_events=True,
-                                ),
-                                sg.Text(i18n("采样率:")),
-                                sg.Text("", key="sr_stream"),
-                            ],
-                        ],
-                        title=i18n("音频设备"),
-                    )
-                ],
-                [
-                    sg.Frame(
-                        layout=[
-                            [
-                                sg.Text(i18n("响应阈值")),
-                                sg.Slider(
-                                    range=(-60, 0),
-                                    key="threhold",
-                                    resolution=1,
-                                    orientation="h",
-                                    default_value=data.get("threhold", -60),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("音调设置")),
-                                sg.Slider(
-                                    range=(-16, 16),
-                                    key="pitch",
-                                    resolution=1,
-                                    orientation="h",
-                                    default_value=data.get("pitch", 0),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("性别因子/声线粗细")),
-                                sg.Slider(
-                                    range=(-2, 2),
-                                    key="formant",
-                                    resolution=0.05,
-                                    orientation="h",
-                                    default_value=data.get("formant", 0.0),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("Index Rate")),
-                                sg.Slider(
-                                    range=(0.0, 1.0),
-                                    key="index_rate",
-                                    resolution=0.01,
-                                    orientation="h",
-                                    default_value=data.get("index_rate", 0),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("响度因子")),
-                                sg.Slider(
-                                    range=(0.0, 1.0),
-                                    key="rms_mix_rate",
-                                    resolution=0.01,
-                                    orientation="h",
-                                    default_value=data.get("rms_mix_rate", 0),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("音高算法")),
-                                sg.Radio(
-                                    "pm",
-                                    "f0method",
-                                    key="pm",
-                                    default=data.get("pm", False),
-                                    enable_events=True,
-                                ),
-                                sg.Radio(
-                                    "rmvpe",
-                                    "f0method",
-                                    key="rmvpe",
-                                    default=data.get("rmvpe", True),
-                                    enable_events=True,
-                                ),
-                                sg.Radio(
-                                    "fcpe",
-                                    "f0method",
-                                    key="fcpe",
-                                    default=data.get("fcpe", False),
-                                    enable_events=True,
-                                ),
-                            ],
-                        ],
-                        title=i18n("常规设置"),
-                    ),
-                    sg.Frame(
-                        layout=[
-                            [
-                                sg.Text(i18n("采样长度")),
-                                sg.Slider(
-                                    range=(0.02, 1.5),
-                                    key="block_time",
-                                    resolution=0.01,
-                                    orientation="h",
-                                    default_value=data.get("block_time", 0.25),
-                                    enable_events=True,
-                                ),
-                            ],
-                            # [
-                            #     sg.Text("设备延迟"),
-                            #     sg.Slider(
-                            #         range=(0, 1),
-                            #         key="device_latency",
-                            #         resolution=0.001,
-                            #         orientation="h",
-                            #         default_value=data.get("device_latency", 0.1),
-                            #         enable_events=True,
-                            #     ),
-                            # ],
-                            [
-                                sg.Text(i18n("淡入淡出长度")),
-                                sg.Slider(
-                                    range=(0.01, 0.15),
-                                    key="crossfade_length",
-                                    resolution=0.01,
-                                    orientation="h",
-                                    default_value=data.get("crossfade_length", 0.05),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Text(i18n("额外推理时长")),
-                                sg.Slider(
-                                    range=(0.05, 5.00),
-                                    key="extra_time",
-                                    resolution=0.01,
-                                    orientation="h",
-                                    default_value=data.get("extra_time", 2.5),
-                                    enable_events=True,
-                                ),
-                            ],
-                            [
-                                sg.Checkbox(
-                                    i18n("输入降噪"),
-                                    key="I_noise_reduce",
-                                    enable_events=True,
-                                ),
-                                sg.Checkbox(
-                                    i18n("输出降噪"),
-                                    key="O_noise_reduce",
-                                    enable_events=True,
-                                ),
-                            ],
-                        ],
-                        title=i18n("性能设置"),
-                    ),
-                ],
-                [
-                    sg.Button(i18n("开始音频转换"), key="start_vc"),
-                    sg.Button(i18n("停止音频转换"), key="stop_vc"),
-                    sg.Radio(
-                        i18n("输入监听"),
-                        "function",
-                        key="im",
-                        default=False,
-                        enable_events=True,
-                    ),
-                    sg.Radio(
-                        i18n("输出变声"),
-                        "function",
-                        key="vc",
-                        default=True,
-                        enable_events=True,
-                    ),
-                    sg.Text(i18n("算法延迟(ms):")),
-                    sg.Text("0", key="delay_time"),
-                    sg.Text(i18n("推理时间(ms):")),
-                    sg.Text("0", key="infer_time"),
-                ],
+                [model_frame],
+                [device_frame],
+                [voice_frame, perf_frame],
+                [status_frame],
             ]
-            self.window = sg.Window("RVC - GUI", layout=layout, finalize=True)
+            self.window = sg.Window(
+                i18n("RVC 实时变声"), layout=layout, finalize=True, resizable=True
+            )
             self.event_handler()
+
+        # ----------------------------------------------------------- events
+
+        def set_status(self, text, color=COLOR_IDLE):
+            self.window["status"].update(text, text_color=color)
+
+        def set_running(self, running):
+            self.window["start_vc"].update(disabled=running)
+            self.window["stop_vc"].update(disabled=not running)
+            if not running:
+                self.window["input_meter"].update(0)
+                self.window["output_meter"].update(0)
+
+        def collect_settings(self, values):
+            settings = {key: values[key] for key in DEFAULTS if key in values}
+            settings["sr_type"] = "sr_model" if values["sr_model"] else "sr_device"
+            settings["f0method"] = next(
+                (name for name in F0_METHODS if values[name]), "rmvpe"
+            )
+            return settings
+
+        def save_settings(self, values):
+            try:
+                with open(realtime_config_path, "w", encoding="utf8") as j:
+                    json.dump(self.collect_settings(values), j, ensure_ascii=False)
+            except Exception:
+                printt(traceback.format_exc())
+
+        def refresh_stats(self):
+            """Mirror the audio thread's numbers; Tk must only be touched here."""
+            if not flag_vc or self.engine is None:
+                return
+            stats = self.engine.stats
+            self.window["infer_time"].update(int(stats["total_ms"]))
+            self.window["input_meter"].update(int(max(0, stats["input_db"] + 60)))
+            self.window["output_meter"].update(int(max(0, stats["output_db"] + 60)))
+            self.window["overruns"].update(stats["overruns"])
+            if stats["overruns"] > self.shown_overruns:
+                self.shown_overruns = stats["overruns"]
+                self.overrun_time = time.monotonic()
+            # Keep the warning up long enough to be read.
+            if time.monotonic() - self.overrun_time < 3:
+                self.set_status(
+                    i18n("过载：推理慢于采样长度，请加大采样长度"), COLOR_BAD
+                )
+            elif not stats["gate_open"]:
+                self.set_status(i18n("运行中 · 静音(低于响应阈值)"), COLOR_WARN)
+            else:
+                self.set_status(i18n("运行中"), COLOR_OK)
+
+        def update_delay(self):
+            if self.stream is None or self.engine is None:
+                return
+            self.delay_time = self.stream.latency[-1] + self.engine.algorithm_delay()
+            self.window["delay_time"].update(int(np.round(self.delay_time * 1000)))
+
+        def refresh_device_lists(self, values):
+            self.gui_config.sg_hostapi = values["sg_hostapi"]
+            self.update_devices(hostapi_name=values["sg_hostapi"])
+            if self.gui_config.sg_hostapi not in self.hostapis:
+                self.gui_config.sg_hostapi = self.hostapis[0] if self.hostapis else ""
+            self.window["sg_hostapi"].Update(
+                values=self.hostapis, value=self.gui_config.sg_hostapi
+            )
+            for key, names in (
+                ("sg_input_device", self.input_devices),
+                ("sg_output_device", self.output_devices),
+            ):
+                current = values[key]
+                if current not in names:
+                    current = names[0] if names else ""
+                self.window[key].Update(values=names, value=current)
 
         def event_handler(self):
             global flag_vc
             while True:
-                event, values = self.window.read()
+                event, values = self.window.read(timeout=100)
                 if event == sg.WINDOW_CLOSED:
                     self.stop_stream()
                     exit()
-                if event == "reload_devices" or event == "sg_hostapi":
-                    self.gui_config.sg_hostapi = values["sg_hostapi"]
-                    self.update_devices(hostapi_name=values["sg_hostapi"])
-                    if self.gui_config.sg_hostapi not in self.hostapis:
-                        self.gui_config.sg_hostapi = self.hostapis[0]
-                    self.window["sg_hostapi"].Update(values=self.hostapis)
-                    self.window["sg_hostapi"].Update(value=self.gui_config.sg_hostapi)
-                    if (
-                        self.gui_config.sg_input_device not in self.input_devices
-                        and len(self.input_devices) > 0
-                    ):
-                        self.gui_config.sg_input_device = self.input_devices[0]
-                    self.window["sg_input_device"].Update(values=self.input_devices)
-                    self.window["sg_input_device"].Update(
-                        value=self.gui_config.sg_input_device
+                if event == sg.TIMEOUT_KEY:
+                    self.refresh_stats()
+                    continue
+                if event in RESTART_KEYS and flag_vc:
+                    # Other parameters do not support hot update
+                    self.stop_stream()
+                    self.set_running(False)
+                    self.set_status(i18n("设置已更改，请重新开始音频转换"), COLOR_WARN)
+                if event in ("reload_devices", "sg_hostapi"):
+                    self.refresh_device_lists(values)
+                elif event == "refresh_models":
+                    self.window["pth_path"].update(
+                        values=list_models(), value=values["pth_path"]
                     )
-                    if self.gui_config.sg_output_device not in self.output_devices:
-                        self.gui_config.sg_output_device = self.output_devices[0]
-                    self.window["sg_output_device"].Update(values=self.output_devices)
-                    self.window["sg_output_device"].Update(
-                        value=self.gui_config.sg_output_device
-                    )
-                if event == "start_vc" and not flag_vc:
-                    if self.set_values(values) == True:
-                        printt(i18n("CUDA可用：%s"), torch.cuda.is_available())
-                        self.start_vc()
-                        settings = {
-                            "pth_path": values["pth_path"],
-                            "index_path": values["index_path"],
-                            "sg_hostapi": values["sg_hostapi"],
-                            "sg_wasapi_exclusive": values["sg_wasapi_exclusive"],
-                            "sg_input_device": values["sg_input_device"],
-                            "sg_output_device": values["sg_output_device"],
-                            "sr_type": ["sr_model", "sr_device"][
-                                [
-                                    values["sr_model"],
-                                    values["sr_device"],
-                                ].index(True)
-                            ],
-                            "threhold": values["threhold"],
-                            "pitch": values["pitch"],
-                            "rms_mix_rate": values["rms_mix_rate"],
-                            "index_rate": values["index_rate"],
-                            # "device_latency": values["device_latency"],
-                            "block_time": values["block_time"],
-                            "crossfade_length": values["crossfade_length"],
-                            "extra_time": values["extra_time"],
-                            "f0method": ["pm", "rmvpe", "fcpe"][
-                                [values["pm"], values["rmvpe"], values["fcpe"]].index(True)
-                            ],
-                        }
-                        with open(realtime_config_path, "w", encoding="utf8") as j:
-                            json.dump(settings, j)
-                        if self.stream is not None:
-                            self.delay_time = (
-                                self.stream.latency[-1]
-                                + values["block_time"]
-                                + values["crossfade_length"]
-                                + 0.01
-                            )
-                        if values["I_noise_reduce"]:
-                            self.delay_time += min(values["crossfade_length"], 0.04)
-                        self.window["sr_stream"].update(self.gui_config.samplerate)
-                        self.window["delay_time"].update(
-                            int(np.round(self.delay_time * 1000))
+                elif event in ("pth_path", "match_index"):
+                    index_path = get_index_path_from_model(values["pth_path"])
+                    if index_path or event == "pth_path":
+                        self.window["index_path"].update(index_path)
+                    else:
+                        self.set_status(i18n("没有找到与该模型匹配的索引"), COLOR_WARN)
+                elif event in PRESETS:
+                    block_time, crossfade, extra_time, f0method = PRESETS[event]
+                    self.window["block_time"].update(block_time)
+                    self.window["crossfade_length"].update(crossfade)
+                    self.window["extra_time"].update(extra_time)
+                    self.window[f0method].update(True)
+                    self.gui_config.f0method = f0method
+                    if flag_vc:
+                        self.stop_stream()
+                        self.set_running(False)
+                        self.set_status(
+                            i18n("设置已更改，请重新开始音频转换"), COLOR_WARN
                         )
+                elif event == "start_vc" and not flag_vc:
+                    if self.set_values(values):
+                        printt(i18n("CUDA可用：%s"), torch.cuda.is_available())
+                        self.set_status(i18n("正在加载模型…"), COLOR_WARN)
+                        self.window.refresh()
+                        try:
+                            self.start_vc()
+                        except Exception as error:
+                            printt(traceback.format_exc())
+                            self.stop_stream()
+                            self.set_status(i18n("启动失败"), COLOR_BAD)
+                            sg.popup(
+                                "%s\n\n%s" % (i18n("启动失败"), error),
+                                title=i18n("启动失败"),
+                            )
+                            continue
+                        self.save_settings(values)
+                        self.shown_overruns = 0
+                        self.overrun_time = float("-inf")
+                        self.set_running(True)
+                        self.set_status(i18n("运行中"), COLOR_OK)
+                        self.window["sr_stream"].update(self.gui_config.samplerate)
+                        self.update_delay()
+                elif event == "stop_vc":
+                    self.stop_stream()
+                    self.set_running(False)
+                    self.set_status(i18n("已停止"))
                 # Parameter hot update
-                if event == "threhold":
+                elif event == "threhold":
                     self.gui_config.threhold = values["threhold"]
                 elif event == "pitch":
                     self.gui_config.pitch = values["pitch"]
@@ -501,248 +588,102 @@ if __name__ == "__main__":
                     self.gui_config.index_rate = values["index_rate"]
                     if hasattr(self, "rvc"):
                         self.rvc.change_index_rate(values["index_rate"])
+                elif event == "protect":
+                    self.gui_config.protect = values["protect"]
+                    if hasattr(self, "rvc"):
+                        self.rvc.change_protect(values["protect"])
                 elif event == "rms_mix_rate":
                     self.gui_config.rms_mix_rate = values["rms_mix_rate"]
-                elif event in ["pm", "rmvpe", "fcpe"]:
+                elif event in F0_METHODS:
                     self.gui_config.f0method = event
                 elif event == "I_noise_reduce":
                     self.gui_config.I_noise_reduce = values["I_noise_reduce"]
-                    if self.stream is not None:
-                        self.delay_time += (
-                            1 if values["I_noise_reduce"] else -1
-                        ) * min(values["crossfade_length"], 0.04)
-                        self.window["delay_time"].update(
-                            int(np.round(self.delay_time * 1000))
-                        )
+                    self.update_delay()
                 elif event == "O_noise_reduce":
                     self.gui_config.O_noise_reduce = values["O_noise_reduce"]
                 elif event in ["vc", "im"]:
-                    self.function = event
-                elif event == "stop_vc" or event != "start_vc":
-                    # Other parameters do not support hot update
-                    self.stop_stream()
+                    self.gui_config.function = event
 
         def set_values(self, values):
-            if len(values["pth_path"].strip()) == 0:
+            pth_path = values["pth_path"].strip()
+            index_path = values["index_path"].strip()
+            if len(pth_path) == 0:
                 sg.popup(i18n("请选择pth文件"))
                 return False
-            if len(values["index_path"].strip()) == 0:
-                sg.popup(i18n("请选择index文件"))
+            if not os.path.isfile(pth_path):
+                sg.popup(i18n("pth文件不存在：%s") % pth_path)
                 return False
-            pattern = re.compile("[^\x00-\x7F]+")
-            if pattern.findall(values["pth_path"]):
-                sg.popup(i18n("pth文件路径不可包含中文"))
-                return False
-            if pattern.findall(values["index_path"]):
+            if index_path and not os.path.isfile(index_path):
+                sg.popup(i18n("索引文件不存在，将不使用索引继续推理：%s") % index_path)
+                index_path = ""
+                self.window["index_path"].update("")
+            # faiss opens the index through a narrow-character path on Windows.
+            if sys.platform == "win32" and re.search("[^\x00-\x7F]", index_path):
                 sg.popup(i18n("index文件路径不可包含中文"))
                 return False
+            if not self.input_devices or not self.output_devices:
+                sg.popup(i18n("没有找到可用的音频输入/输出设备"))
+                return False
+            if (
+                values["sg_input_device"] not in self.input_devices
+                or values["sg_output_device"] not in self.output_devices
+            ):
+                sg.popup(i18n("请选择输入设备和输出设备"))
+                return False
             self.set_devices(values["sg_input_device"], values["sg_output_device"])
-            # self.device_latency = values["device_latency"]
-            self.gui_config.sg_hostapi = values["sg_hostapi"]
-            self.gui_config.sg_wasapi_exclusive = values["sg_wasapi_exclusive"]
-            self.gui_config.sg_input_device = values["sg_input_device"]
-            self.gui_config.sg_output_device = values["sg_output_device"]
-            self.gui_config.pth_path = values["pth_path"]
-            self.gui_config.index_path = values["index_path"]
-            self.gui_config.sr_type = ["sr_model", "sr_device"][
-                [
-                    values["sr_model"],
-                    values["sr_device"],
-                ].index(True)
-            ]
-            self.gui_config.threhold = values["threhold"]
-            self.gui_config.pitch = values["pitch"]
-            self.gui_config.formant = values["formant"]
-            self.gui_config.block_time = values["block_time"]
-            self.gui_config.crossfade_time = values["crossfade_length"]
-            self.gui_config.extra_time = values["extra_time"]
-            self.gui_config.I_noise_reduce = values["I_noise_reduce"]
-            self.gui_config.O_noise_reduce = values["O_noise_reduce"]
-            self.gui_config.rms_mix_rate = values["rms_mix_rate"]
-            self.gui_config.index_rate = values["index_rate"]
-            self.gui_config.f0method = ["pm", "rmvpe", "fcpe"][
-                [values["pm"], values["rmvpe"], values["fcpe"]].index(True)
-            ]
+            settings = self.collect_settings(values)
+            cfg = self.gui_config
+            cfg.sg_hostapi = values["sg_hostapi"]
+            cfg.sg_wasapi_exclusive = values["sg_wasapi_exclusive"]
+            cfg.sg_input_device = values["sg_input_device"]
+            cfg.sg_output_device = values["sg_output_device"]
+            cfg.pth_path = pth_path
+            cfg.index_path = index_path
+            cfg.sr_type = settings["sr_type"]
+            cfg.threhold = values["threhold"]
+            cfg.pitch = values["pitch"]
+            cfg.formant = values["formant"]
+            cfg.block_time = values["block_time"]
+            cfg.crossfade_time = values["crossfade_length"]
+            cfg.extra_time = values["extra_time"]
+            cfg.I_noise_reduce = values["I_noise_reduce"]
+            cfg.O_noise_reduce = values["O_noise_reduce"]
+            cfg.rms_mix_rate = values["rms_mix_rate"]
+            cfg.index_rate = values["index_rate"] if index_path else 0.0
+            cfg.protect = values["protect"]
+            cfg.f0method = settings["f0method"]
+            cfg.function = "vc" if values["vc"] else "im"
             return True
 
         def start_vc(self):
             torch.cuda.empty_cache()
+            cfg = self.gui_config
             self.rvc = rvc_for_realtime.RVC(
-                self.gui_config.pitch,
-                self.gui_config.formant,
-                self.gui_config.pth_path,
-                self.gui_config.index_path,
-                self.gui_config.index_rate,
+                cfg.pitch,
+                cfg.formant,
+                cfg.pth_path,
+                cfg.index_path,
+                cfg.index_rate,
                 self.config,
                 self.rvc if hasattr(self, "rvc") else None,
+                protect=cfg.protect,
             )
-            self.gui_config.samplerate = (
+            cfg.samplerate = (
                 self.rvc.tgt_sr
-                if self.gui_config.sr_type == "sr_model"
+                if cfg.sr_type == "sr_model"
                 else self.get_device_samplerate()
             )
-            self.gui_config.channels = self.get_device_channels()
-            self.zc = self.gui_config.samplerate // 100
-            self.block_frame = (
-                int(
-                    np.round(
-                        self.gui_config.block_time
-                        * self.gui_config.samplerate
-                        / self.zc
-                    )
-                )
-                * self.zc
+            cfg.channels = self.get_device_channels()
+            self.engine = RealtimeEngine(
+                self.rvc, cfg, self.config.device, cfg.samplerate
             )
-            self.block_frame_16k = 160 * self.block_frame // self.zc
-            self.crossfade_frame = (
-                int(
-                    np.round(
-                        self.gui_config.crossfade_time
-                        * self.gui_config.samplerate
-                        / self.zc
-                    )
-                )
-                * self.zc
-            )
-            self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
-            self.sola_search_frame = self.zc
-            self.extra_frame = (
-                int(
-                    np.round(
-                        self.gui_config.extra_time
-                        * self.gui_config.samplerate
-                        / self.zc
-                    )
-                )
-                * self.zc
-            )
-            self.input_wav = torch.zeros(
-                self.extra_frame
-                + self.crossfade_frame
-                + self.sola_search_frame
-                + self.block_frame,
-                device=self.config.device,
-                dtype=torch.float32,
-            )
-            self.input_wav_denoise = self.input_wav.clone()
-            self.input_wav_res = torch.zeros(
-                160 * self.input_wav.shape[0] // self.zc,
-                device=self.config.device,
-                dtype=torch.float32,
-            )
-            self.rms_buffer = np.zeros(4 * self.zc, dtype="float32")
-            self.sola_buffer = torch.zeros(
-                self.sola_buffer_frame, device=self.config.device, dtype=torch.float32
-            )
-            self.sola_den_kernel = torch.ones(
-                1,
-                1,
-                self.sola_buffer_frame,
-                device=self.config.device,
-                dtype=torch.float32,
-            )
-            self.nr_buffer = self.sola_buffer.clone()
-            self.output_buffer = self.input_wav.clone()
-            self.skip_head = self.extra_frame // self.zc
-            self.return_length = (
-                self.block_frame + self.sola_buffer_frame + self.sola_search_frame
-            ) // self.zc
-            self.fade_in_window = (
-                torch.sin(
-                    0.5
-                    * np.pi
-                    * torch.linspace(
-                        0.0,
-                        1.0,
-                        steps=self.sola_buffer_frame,
-                        device=self.config.device,
-                        dtype=torch.float32,
-                    )
-                )
-                ** 2
-            )
-            self.fade_out_window = 1 - self.fade_in_window
-            self.resampler = tat.Resample(
-                orig_freq=self.gui_config.samplerate,
-                new_freq=16000,
-                dtype=torch.float32,
-            ).to(self.config.device)
-            if self.rvc.tgt_sr != self.gui_config.samplerate:
-                self.resampler2 = tat.Resample(
-                    orig_freq=self.rvc.tgt_sr,
-                    new_freq=self.gui_config.samplerate,
-                    dtype=torch.float32,
-                ).to(self.config.device)
-            else:
-                self.resampler2 = None
-            # Bundled torch.istft is not CUDA Graph-capturable, so TorchGate
-            # stays eager while resampling and RVC inference still use graphs.
-            self.tg = TorchGate(
-                sr=self.gui_config.samplerate, n_fft=4 * self.zc, prop_decrease=0.9
-            ).to(self.config.device)
-            self.prewarm_cuda_graph()
+            printt(i18n("正在预热模型"))
+            self.engine.prewarm()
             self.start_stream()
-
-        def prewarm_cuda_graph(self):
-            if not cuda_graph_enabled(self.config.device):
-                return
-            try:
-                printt(i18n("正在预热CUDA Graph"))
-                samples = self.input_wav_res.shape[0]
-                phase = torch.arange(
-                    samples, device=self.config.device, dtype=torch.float32
-                )
-                probe = 0.05 * torch.sin(2 * np.pi * 220.0 * phase / 16000.0)
-                self.input_wav_res.copy_(probe)
-
-                if self.gui_config.I_noise_reduce:
-                    short = self.input_wav[
-                        -self.sola_buffer_frame - self.block_frame :
-                    ].unsqueeze(0)
-                    self.tg(short, self.input_wav.unsqueeze(0))
-
-                resample_input = self.input_wav[-self.block_frame - 2 * self.zc :]
-                run_cuda_graph(
-                    self.resampler,
-                    "realtime-input-resample",
-                    lambda audio: self.resampler(audio),
-                    resample_input,
-                )
-
-                inferred = self.rvc.infer(
-                    self.input_wav_res,
-                    self.block_frame_16k,
-                    self.skip_head,
-                    self.return_length,
-                    self.gui_config.f0method,
-                )
-                if self.resampler2 is not None:
-                    inferred = run_cuda_graph(
-                        self.resampler2,
-                        "realtime-output-resample",
-                        lambda audio: self.resampler2(audio),
-                        inferred,
-                    )
-                if self.gui_config.O_noise_reduce:
-                    self.tg(inferred.unsqueeze(0), self.output_buffer.unsqueeze(0))
-                torch.cuda.synchronize(self.config.device)
-                printt(i18n("CUDA Graph预热完成"))
-            except Exception:
-                printt(traceback.format_exc())
-            finally:
-                self.input_wav.zero_()
-                self.input_wav_denoise.zero_()
-                self.input_wav_res.zero_()
-                self.output_buffer.zero_()
-                self.sola_buffer.zero_()
-                self.nr_buffer.zero_()
-                self.rvc.cache_pitch.zero_()
-                self.rvc.cache_pitchf.zero_()
 
         def start_stream(self):
             global flag_vc
             if not flag_vc:
-                flag_vc = True
                 if (
                     "WASAPI" in self.gui_config.sg_hostapi
                     and self.gui_config.sg_wasapi_exclusive
@@ -752,189 +693,36 @@ if __name__ == "__main__":
                     extra_settings = None
                 self.stream = sd.Stream(
                     callback=self.audio_callback,
-                    blocksize=self.block_frame,
+                    blocksize=self.engine.block_frame,
                     samplerate=self.gui_config.samplerate,
                     channels=self.gui_config.channels,
                     dtype="float32",
                     extra_settings=extra_settings,
                 )
                 self.stream.start()
+                flag_vc = True
 
         def stop_stream(self):
             global flag_vc
-            if flag_vc:
-                flag_vc = False
-                if self.stream is not None:
-                    self.stream.abort()
-                    self.stream.close()
-                    self.stream = None
+            flag_vc = False
+            if self.stream is not None:
+                self.stream.abort()
+                self.stream.close()
+                self.stream = None
 
-        def audio_callback(
-            self, indata, outdata, frames, times, status
-        ):
+        def audio_callback(self, indata, outdata, frames, times, status):
             """
             音频处理
+
+            Runs on the sound card thread: no printing and no GUI calls here,
+            both stall the callback and are heard as crackles.
             """
-            global flag_vc
-            start_time = time.perf_counter()
-            indata = librosa.to_mono(indata.T)
-            if self.gui_config.threhold > -60:
-                indata = np.append(self.rms_buffer, indata)
-                rms = librosa.feature.rms(
-                    y=indata, frame_length=4 * self.zc, hop_length=self.zc
-                )[:, 2:]
-                self.rms_buffer[:] = indata[-4 * self.zc :]
-                indata = indata[2 * self.zc - self.zc // 2 :]
-                db_threhold = (
-                    librosa.amplitude_to_db(rms, ref=1.0)[0] < self.gui_config.threhold
-                )
-                for i in range(db_threhold.shape[0]):
-                    if db_threhold[i]:
-                        indata[i * self.zc : (i + 1) * self.zc] = 0
-                indata = indata[self.zc // 2 :]
-            self.input_wav[: -self.block_frame] = self.input_wav[
-                self.block_frame :
-            ].clone()
-            self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(
-                self.config.device
-            )
-            self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
-                self.block_frame_16k :
-            ].clone()
-            # input noise reduction and resampling
-            if self.gui_config.I_noise_reduce:
-                self.input_wav_denoise[: -self.block_frame] = self.input_wav_denoise[
-                    self.block_frame :
-                ].clone()
-                input_wav = self.input_wav[-self.sola_buffer_frame - self.block_frame :]
-                input_wav = self.tg(
-                    input_wav.unsqueeze(0), self.input_wav.unsqueeze(0)
-                ).squeeze(0)
-                input_wav[: self.sola_buffer_frame] *= self.fade_in_window
-                input_wav[: self.sola_buffer_frame] += (
-                    self.nr_buffer * self.fade_out_window
-                )
-                self.input_wav_denoise[-self.block_frame :] = input_wav[
-                    : self.block_frame
-                ]
-                self.nr_buffer[:] = input_wav[self.block_frame :]
-                resample_input = self.input_wav_denoise[
-                    -self.block_frame - 2 * self.zc :
-                ]
-                self.input_wav_res[-self.block_frame_16k - 160 :] = run_cuda_graph(
-                    self.resampler,
-                    "realtime-input-resample",
-                    lambda audio: self.resampler(audio),
-                    resample_input,
-                )[160:]
-            else:
-                resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
-                self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = run_cuda_graph(
-                    self.resampler,
-                    "realtime-input-resample",
-                    lambda audio: self.resampler(audio),
-                    resample_input,
-                )[160:]
-            # infer
-            if self.function == "vc":
-                infer_wav = self.rvc.infer(
-                    self.input_wav_res,
-                    self.block_frame_16k,
-                    self.skip_head,
-                    self.return_length,
-                    self.gui_config.f0method,
-                )
-                if self.resampler2 is not None:
-                    infer_wav = run_cuda_graph(
-                        self.resampler2,
-                        "realtime-output-resample",
-                        lambda audio: self.resampler2(audio),
-                        infer_wav,
-                    )
-            elif self.gui_config.I_noise_reduce:
-                infer_wav = self.input_wav_denoise[self.extra_frame :].clone()
-            else:
-                infer_wav = self.input_wav[self.extra_frame :].clone()
-            # output noise reduction
-            if self.gui_config.O_noise_reduce and self.function == "vc":
-                self.output_buffer[: -self.block_frame] = self.output_buffer[
-                    self.block_frame :
-                ].clone()
-                self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
-                infer_wav = self.tg(
-                    infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)
-                ).squeeze(0)
-            # volume envelop mixing
-            if self.gui_config.rms_mix_rate < 1 and self.function == "vc":
-                if self.gui_config.I_noise_reduce:
-                    input_wav = self.input_wav_denoise[self.extra_frame :]
-                else:
-                    input_wav = self.input_wav[self.extra_frame :]
-                rms1 = librosa.feature.rms(
-                    y=input_wav[: infer_wav.shape[0]].cpu().numpy(),
-                    frame_length=4 * self.zc,
-                    hop_length=self.zc,
-                )
-                rms1 = torch.from_numpy(rms1).to(self.config.device)
-                rms1 = F.interpolate(
-                    rms1.unsqueeze(0),
-                    size=infer_wav.shape[0] + 1,
-                    mode="linear",
-                    align_corners=True,
-                )[0, 0, :-1]
-                rms2 = librosa.feature.rms(
-                    y=infer_wav[:].cpu().numpy(),
-                    frame_length=4 * self.zc,
-                    hop_length=self.zc,
-                )
-                rms2 = torch.from_numpy(rms2).to(self.config.device)
-                rms2 = F.interpolate(
-                    rms2.unsqueeze(0),
-                    size=infer_wav.shape[0] + 1,
-                    mode="linear",
-                    align_corners=True,
-                )[0, 0, :-1]
-                rms2 = torch.max(rms2, torch.zeros_like(rms2) + 1e-3)
-                infer_wav *= torch.pow(
-                    rms1 / rms2, 1.0 - self.gui_config.rms_mix_rate
-                )
-            # SOLA algorithm from https://github.com/yxlllc/DDSP-SVC
-            conv_input = infer_wav[
-                None, None, : self.sola_buffer_frame + self.sola_search_frame
-            ]
-            cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
-            cor_den = torch.sqrt(
-                F.conv1d(
-                    conv_input**2,
-                    self.sola_den_kernel,
-                )
-                + 1e-8
-            )
-            if sys.platform == "darwin":
-                _, sola_offset = torch.max(cor_nom[0, 0] / cor_den[0, 0])
-                sola_offset = sola_offset.item()
-            else:
-                sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
-            printt(i18n("SOLA偏移：%d"), int(sola_offset))
-            infer_wav = infer_wav[sola_offset:]
-            infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
-            infer_wav[: self.sola_buffer_frame] += (
-                self.sola_buffer * self.fade_out_window
-            )
-            self.sola_buffer[:] = infer_wav[
-                self.block_frame : self.block_frame + self.sola_buffer_frame
-            ]
-            outdata[:] = (
-                infer_wav[: self.block_frame]
-                .repeat(self.gui_config.channels, 1)
-                .t()
-                .cpu()
-                .numpy()
-            )
-            total_time = time.perf_counter() - start_time
-            if flag_vc:
-                self.window["infer_time"].update(int(total_time * 1000))
-            printt(i18n("推理耗时：%.2f秒"), total_time)
+            try:
+                out = self.engine.process(librosa.to_mono(indata.T))
+                outdata[:] = out[:, None]
+            except Exception:
+                outdata.fill(0)
+                printt(traceback.format_exc())
 
         def update_devices(self, hostapi_name=None):
             """获取设备列表"""
@@ -949,7 +737,7 @@ if __name__ == "__main__":
                     devices[device_idx]["hostapi_name"] = hostapi["name"]
             self.hostapis = [hostapi["name"] for hostapi in hostapis]
             if hostapi_name not in self.hostapis:
-                hostapi_name = self.hostapis[0]
+                hostapi_name = self.hostapis[0] if self.hostapis else None
             self.input_devices = [
                 d["name"]
                 for d in devices

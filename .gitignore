@@ -20,3 +20,5 @@ __pycache__/
 # Bundled local executables
 ffmpeg.exe
 ffprobe.exe
+datasets/
+.venv/

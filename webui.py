@@ -52,6 +52,9 @@ from tools.pymss_webui import (
 )
 from tools.file_io import read_text
 from tools.process_utils import kill_process_tree
+from tools import voice_clone
+from tools.download_models import download_assets, inference_assets, training_assets
+from tools.webui_theme import APP_CSS, card_title, header_html
 from tools.multispeaker import (
     ManifestError,
     build_manifest_from_root,
@@ -125,7 +128,8 @@ def launch_webui_with_port_fallback(app, config):
             )
         try:
             queued_app.launch(
-                server_name="0.0.0.0",
+                # RVC_WEBUI_HOST=127.0.0.1 keeps the UI off the network.
+                server_name=os.environ.get("RVC_WEBUI_HOST", "0.0.0.0"),
                 inbrowser=not config.noautoopen,
                 server_port=config.listen_port,
                 quiet=True,
@@ -1711,6 +1715,148 @@ def train1key(
 def stop_train1key():
     return stop_train_task("一键训练")
 
+
+# Total epochs per quality preset of the one-click cloning tab.
+CLONE_PRESETS = {
+    "快速试听（20轮）": 20,
+    "标准（50轮）": 50,
+    "精细（120轮）": 120,
+}
+CLONE_STOP = threading.Event()
+
+
+def clone_preset_choices():
+    return [i18n(label) for label in CLONE_PRESETS]
+
+
+def clone_voice(name, files, recording, folder, preset, sr, batch_size):
+    """Upload-to-model in one click: dataset, base models, training, index."""
+    keep = {"__type__": "update"}
+
+    def emit(state, detail="", running=True, model=None):
+        return (
+            format_status("一键克隆音色", state, detail),
+            button_update(visible=not running),
+            button_update(visible=running),
+            model or keep,
+            dict(model) if model else keep,
+        )
+
+    CLONE_STOP.clear()
+    try:
+        name = voice_clone.validate_name(name)
+        yield emit("准备训练素材")
+        trainset_dir, count, seconds = voice_clone.prepare_dataset(
+            os.path.join(now_dir, "datasets", name), files, recording, folder
+        )
+    except ValueError as error:
+        yield emit("失败", i18n(str(error)), running=False)
+        return
+    except Exception:
+        yield emit("失败", traceback.format_exc(), running=False)
+        return
+    summary = voice_clone.describe_dataset(count, seconds)
+
+    try:
+        assets = inference_assets() + training_assets("v2", sr, True)
+        for line in download_assets(assets, CLONE_STOP.is_set):
+            yield emit("下载基础模型", "%s\n\n%s" % (summary, line))
+    except InterruptedError:
+        yield emit("已停止", summary, running=False)
+        return
+    except Exception as error:
+        yield emit("失败", "%s\n\n%s" % (summary, error), running=False)
+        return
+    if CLONE_STOP.is_set():
+        yield emit("已停止", summary, running=False)
+        return
+
+    presets = dict(zip(clone_preset_choices(), CLONE_PRESETS.values()))
+    total_epoch = presets.get(preset, 50)
+    pretrained_g, pretrained_d = get_pretrained_models("_v2", "f0", sr)
+    status = ""
+    for status, _, _, _ in train1key(
+        name,
+        sr,
+        True,
+        trainset_dir,
+        0,
+        int(np.ceil(config.n_cpu / 1.5)),
+        default_training_f0_method,
+        min(10, total_epoch),
+        total_epoch,
+        int(batch_size),
+        i18n("是"),
+        pretrained_g,
+        pretrained_d,
+        gpus,
+        i18n("否"),
+        i18n("否"),
+        "v2",
+        feature_gpus,
+    ):
+        yield emit("运行中", "%s\n\n%s" % (summary, status))
+
+    model_name = "%s.pth" % name
+    finished = "%s：%s" % (i18n("状态"), i18n("已完成")) in status
+    if not finished or not os.path.isfile(os.path.join(weight_root, model_name)):
+        yield emit("未完成", "%s\n\n%s" % (summary, status), running=False)
+        return
+    index_path = get_index_path_from_model(model_name)
+    detail = "\n".join(
+        (
+            summary,
+            "",
+            "%s：%s" % (i18n("模型"), os.path.join(weight_root, model_name)),
+            "%s：%s" % (i18n("索引"), index_path or i18n("未生成")),
+            "",
+            i18n("现在可以在右侧试听，也可以在“模型推理”或实时变声(realtime_gui)中直接选择该音色。"),
+        )
+    )
+    yield emit(
+        "已完成",
+        detail,
+        running=False,
+        model={"choices": weight_names(), "value": model_name, "__type__": "update"},
+    )
+
+
+def stop_clone():
+    CLONE_STOP.set()
+    return stop_train_task("一键训练")
+
+
+def clone_try(model_name, upload, recording, pitch):
+    """Convert a short clip with the chosen voice using sensible defaults."""
+    keep = {"__type__": "update"}
+    audio = recording or upload
+    if not model_name:
+        return format_status("试听", "等待输入", i18n("请先选择或克隆一个音色")), None, keep
+    if not audio:
+        return format_status("试听", "等待输入", i18n("请上传音频文件")), None, keep
+    try:
+        vc.get_vc(model_name, 0.33, 0.33)
+        index_path = get_index_path_from_model(model_name)
+        info, converted = vc.vc_single(
+            0,
+            audio,
+            pitch,
+            "rmvpe",
+            index_path,
+            0.75 if index_path else 0,
+            0,
+            0.25,
+            0.33,
+        )
+    except Exception:
+        return format_status("试听", "失败", traceback.format_exc()), None, keep
+    return info, converted, {"value": model_name, "__type__": "update"}
+
+
+def refresh_model_choices():
+    update = change_choices()
+    return update, dict(update)
+
 #                    ckpt_path2.change(change_info_,[ckpt_path2],[sr__,if_f0__])
 def change_info_(ckpt_path):
     if not os.path.exists(ckpt_path.replace(os.path.basename(ckpt_path), "train.log")):
@@ -1826,66 +1972,218 @@ def change_f0_method(f0method8):
     return {"visible": visible, "__type__": "update"}
 
 
-with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
-    gr.Markdown("## RVC WebUI")
-    gr.Markdown(
-        value=i18n(
-            "本软件以MIT协议开源, 作者不对软件具备任何控制力, 使用软件者、传播软件导出的声音者自负全责. <br>如不认可该条款, 则不能使用或引用软件包内任何代码和文件. 详见根目录<b>LICENSE</b>."
+with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS + APP_CSS) as app:
+    gr.HTML(
+        header_html(
+            "RVC WebUI",
+            i18n("音色克隆 · 语音转换 · 实时变声"),
+            (
+                "%s：%s" % (i18n("设备"), config.device),
+                "%s：%s" % (i18n("音色数"), len(names)),
+            ),
+            i18n(
+                "本软件以MIT协议开源, 作者不对软件具备任何控制力, 使用软件者、传播软件导出的声音者自负全责. <br>如不认可该条款, 则不能使用或引用软件包内任何代码和文件. 详见根目录<b>LICENSE</b>."
+            ),
         )
     )
     with gr.Tabs():
+        with gr.TabItem(i18n("一键克隆")):
+            with gr.Row():
+                with gr.Column(scale=5, min_width=360, elem_id="rvc-card-clone-source"):
+                    gr.HTML(
+                        card_title(
+                            1,
+                            i18n("准备声音素材"),
+                            i18n(
+                                "上传或录制目标人物的干净人声，建议总时长 1~10 分钟以上；素材带伴奏或混响时，请先到“人声伴奏分离&去混响”页处理。"
+                            ),
+                        )
+                    )
+                    clone_name = gr.Textbox(
+                        label=i18n("音色名称（英文、数字、下划线）"),
+                        value="my_voice",
+                        max_lines=1,
+                    )
+                    clone_files = gr.File(
+                        file_count="multiple",
+                        label=i18n("上传人声音频（可多选）"),
+                    )
+                    clone_recording = gr.Audio(
+                        label=i18n("或者直接录音"),
+                        source="microphone",
+                        type="filepath",
+                    )
+                    clone_preset = gr.Radio(
+                        label=i18n("训练质量"),
+                        choices=clone_preset_choices(),
+                        value=clone_preset_choices()[1],
+                        interactive=True,
+                    )
+                    with gr.Accordion(i18n("更多选项"), open=False):
+                        clone_folder = gr.Textbox(
+                            label=i18n("素材文件夹路径（素材很多时填写，可代替上传）"),
+                            placeholder="E:\\my_voice_dataset",
+                            max_lines=1,
+                        )
+                        clone_sr = gr.Radio(
+                            label=i18n("目标采样率"),
+                            choices=["40k", "48k"],
+                            value="40k",
+                            interactive=True,
+                        )
+                        clone_batch_size = gr.Slider(
+                            minimum=1,
+                            maximum=40,
+                            step=1,
+                            label=i18n("每张显卡的batch_size"),
+                            value=default_batch_size,
+                            interactive=True,
+                        )
+                    clone_button = gr.Button(
+                        i18n("开始克隆"), variant="primary", elem_id="rvc-main-clone"
+                    )
+                    clone_stop_button = gr.Button(
+                        i18n("停止克隆"), variant="stop", visible=False
+                    )
+                with gr.Column(scale=5, min_width=360):
+                    with gr.Column(elem_id="rvc-card-clone-progress"):
+                        gr.HTML(
+                            card_title(
+                                2,
+                                i18n("等待训练完成"),
+                                i18n(
+                                    "自动完成：下载基础模型 → 切分素材 → 提取音高与特征 → 训练 → 生成索引。首次使用需要下载约 500MB 基础模型。"
+                                ),
+                            )
+                        )
+                        clone_info = gr.Textbox(
+                            label=i18n("输出信息"),
+                            value="",
+                            lines=12,
+                            max_lines=12,
+                            elem_id="rvc-log-clone",
+                        )
+                    with gr.Column(elem_id="rvc-card-clone-try"):
+                        gr.HTML(
+                            card_title(
+                                3,
+                                i18n("试听"),
+                                i18n("上传或录一段你自己的声音，听听变成该音色的效果。"),
+                            )
+                        )
+                        clone_model = gr.Dropdown(
+                            label=i18n("推理音色"),
+                            choices=sorted(names),
+                            value=sorted(names)[0] if names else None,
+                            interactive=True,
+                        )
+                        with gr.Row():
+                            clone_try_upload = gr.Audio(
+                                label=i18n("上传试听音频"),
+                                source="upload",
+                                type="filepath",
+                            )
+                            clone_try_recording = gr.Audio(
+                                label=i18n("或者直接录音"),
+                                source="microphone",
+                                type="filepath",
+                            )
+                        clone_try_pitch = gr.Slider(
+                            minimum=-12,
+                            maximum=12,
+                            step=1,
+                            value=0,
+                            label=i18n("变调（男转女 +12，女转男 -12）"),
+                            interactive=True,
+                        )
+                        clone_try_button = gr.Button(i18n("试听转换"), variant="primary")
+                        clone_try_output = gr.Audio(label=i18n("试听结果"))
+                        clone_try_info = gr.Textbox(
+                            label=i18n("输出信息"), lines=3, max_lines=3
+                        )
         with gr.TabItem(i18n("模型推理")):
             with gr.Row():
-                sid0 = gr.Dropdown(label=i18n("推理音色"), choices=sorted(names))
-                with gr.Column():
-                    refresh_button = gr.Button(
-                        i18n("刷新音色列表"), variant="primary"
+                # The speaker selectors stay hidden for single-speaker models;
+                # sharing a column with the voice list avoids an empty panel.
+                with gr.Column(scale=4, min_width=320):
+                    sid0 = gr.Dropdown(label=i18n("推理音色"), choices=sorted(names))
+                    spk_item = gr.Slider(
+                        minimum=0,
+                        maximum=2333,
+                        step=1,
+                        label=i18n("请选择说话人id"),
+                        value=0,
+                        visible=False,
+                        interactive=True,
                     )
-                    clean_button = gr.Button(i18n("卸载音色省显存"), variant="primary")
-                spk_item = gr.Slider(
-                    minimum=0,
-                    maximum=2333,
-                    step=1,
-                    label=i18n("请选择说话人id"),
-                    value=0,
-                    visible=False,
-                    interactive=True,
-                )
-                spk_item_dropdown = gr.Dropdown(
-                    label=i18n("选择多说话人音色"),
-                    choices=[],
-                    value=None,
-                    visible=False,
-                    interactive=True,
-                )
+                    spk_item_dropdown = gr.Dropdown(
+                        label=i18n("选择多说话人音色"),
+                        choices=[],
+                        value=None,
+                        visible=False,
+                        interactive=True,
+                    )
+                with gr.Column(scale=1, min_width=200):
+                    refresh_button = gr.Button(i18n("刷新音色列表"))
+                    clean_button = gr.Button(i18n("卸载音色省显存"))
                 clean_button.click(
                     fn=clean, inputs=[], outputs=[sid0], api_name="infer_clean"
                 )
+                refresh_button.click(
+                    fn=refresh_model_choices,
+                    inputs=[],
+                    outputs=[sid0, clone_model],
+                    api_name="infer_refresh",
+                )
             with gr.TabItem(i18n("单次推理")):
-                with gr.Group():
+                with gr.Row():
+                    with gr.Column(scale=5, min_width=360, elem_id="rvc-card-infer-input"):
+                        gr.HTML(card_title("", i18n("输入")))
+                        input_audio0 = gr.Audio(
+                            label=i18n("拖拽或点击上传待处理音频"),
+                            source="upload",
+                            type="filepath",
+                            interactive=True,
+                        )
+                        with gr.Row(equal_height=True):
+                            with gr.Column(scale=1, min_width=120):
+                                vc_transform0 = gr.Number(
+                                    label=i18n("变调(整数, 半音数量, 升八度12降八度-12)"),
+                                    value=0,
+                                )
+                            with gr.Column(scale=2, min_width=200):
+                                f0method0 = gr.Radio(
+                                    label=i18n("选择音高提取算法"),
+                                    choices=["pm", "rmvpe", "fcpe"],
+                                    value="rmvpe",
+                                    interactive=True,
+                                )
+                        but0 = gr.Button(
+                            i18n("转换"), variant="primary", elem_id="rvc-main-convert"
+                        )
+                    with gr.Column(scale=5, min_width=360, elem_id="rvc-card-infer-output"):
+                        gr.HTML(card_title("", i18n("输出")))
+                        vc_output2 = gr.Audio(
+                            label=i18n("输出音频(右下角三个点,点了可以下载)")
+                        )
+                        vc_output1 = gr.Textbox(
+                            label=i18n("输出信息"), lines=6, max_lines=6
+                        )
+                with gr.Accordion(i18n("高级设置"), open=False):
                     with gr.Row():
                         with gr.Column():
-                            with gr.Row(equal_height=True):
-                                with gr.Column(scale=1, min_width=120):
-                                    vc_transform0 = gr.Number(
-                                        label=i18n("变调(整数, 半音数量, 升八度12降八度-12)"),
-                                        value=0,
-                                    )
-                                with gr.Column(scale=2, min_width=200):
-                                    f0method0 = gr.Radio(
-                                        label=i18n("选择音高提取算法"),
-                                        choices=["pm", "rmvpe", "fcpe"],
-                                        value="rmvpe",
-                                        interactive=True,
-                                    )
-                            input_audio0 = gr.Audio(
-                                label=i18n("拖拽或点击上传待处理音频"),
-                                source="upload",
-                                type="filepath",
+                            index_rate1 = gr.Slider(
+                                minimum=0,
+                                maximum=1,
+                                label=i18n("检索特征占比"),
+                                value=0.75,
                                 interactive=True,
                             )
-
-                        with gr.Column():
+                            file_index1 = gr.Textbox(
+                                label=i18n("特征检索库文件路径（选择模型后自动匹配，可手动修改）"),
+                                placeholder="C:\\Users\\Desktop\\model_example.index",
+                                interactive=True,
+                            )
                             resample_sr0 = gr.Slider(
                                 minimum=0,
                                 maximum=48000,
@@ -1894,6 +2192,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                                 step=1,
                                 interactive=True,
                             )
+                        with gr.Column():
                             rms_mix_rate0 = gr.Slider(
                                 minimum=0,
                                 maximum=1,
@@ -1913,57 +2212,30 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                                 step=0.01,
                                 interactive=True,
                             )
-                            index_rate1 = gr.Slider(
-                                minimum=0,
-                                maximum=1,
-                                label=i18n("检索特征占比"),
-                                value=0.75,
-                                interactive=True,
-                            )
-                            file_index1 = gr.Textbox(
-                                label=i18n("特征检索库文件路径（选择模型后自动匹配，可手动修改）"),
-                                placeholder="C:\\Users\\Desktop\\model_example.index",
-                                interactive=True,
-                            )
-                            refresh_button.click(
-                                fn=change_choices,
-                                inputs=[],
-                                outputs=sid0,
-                                api_name="infer_refresh",
-                            )
-                with gr.Group():
-                    with gr.Column():
-                        but0 = gr.Button(i18n("转换"), variant="primary")
-                        with gr.Row():
-                            vc_output1 = gr.Textbox(label=i18n("输出信息"))
-                            vc_output2 = gr.Audio(
-                                label=i18n("输出音频(右下角三个点,点了可以下载)")
-                            )
-
-                        but0.click(
-                            report_missing_index,
-                            [file_index1],
-                            [],
-                            queue=False,
-                            api_name="infer_check_index",
-                        )
-                        but0.click(
-                            vc_single_with_speaker,
-                            [
-                                spk_item,
-                                spk_item_dropdown,
-                                input_audio0,
-                                vc_transform0,
-                                f0method0,
-                                file_index1,
-                                index_rate1,
-                                resample_sr0,
-                                rms_mix_rate0,
-                                protect0,
-                            ],
-                            [vc_output1, vc_output2],
-                            api_name="infer_convert",
-                        )
+                but0.click(
+                    report_missing_index,
+                    [file_index1],
+                    [],
+                    queue=False,
+                    api_name="infer_check_index",
+                )
+                but0.click(
+                    vc_single_with_speaker,
+                    [
+                        spk_item,
+                        spk_item_dropdown,
+                        input_audio0,
+                        vc_transform0,
+                        f0method0,
+                        file_index1,
+                        index_rate1,
+                        resample_sr0,
+                        rms_mix_rate0,
+                        protect0,
+                    ],
+                    [vc_output1, vc_output2],
+                    api_name="infer_convert",
+                )
             with gr.TabItem(i18n("批量推理")):
                 gr.Markdown(
                     value=i18n(
@@ -2837,6 +3109,35 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS) as app:
                 gr.Markdown(value=info)
             except Exception:
                 gr.Markdown(traceback.format_exc())
+
+    # The cloning tab is declared first but drives the inference voice list,
+    # so its events are wired once every component exists.
+    clone_button.click(
+        clone_voice,
+        [
+            clone_name,
+            clone_files,
+            clone_recording,
+            clone_folder,
+            clone_preset,
+            clone_sr,
+            clone_batch_size,
+        ],
+        [clone_info, clone_button, clone_stop_button, sid0, clone_model],
+        api_name="clone_voice",
+    )
+    clone_stop_button.click(
+        stop_clone,
+        [],
+        [clone_info, clone_button, clone_stop_button],
+        queue=False,
+    )
+    clone_try_button.click(
+        clone_try,
+        [clone_model, clone_try_upload, clone_try_recording, clone_try_pitch],
+        [clone_try_info, clone_try_output, sid0],
+        api_name="clone_try",
+    )
 
     if config.iscolab:
         app.queue(concurrency_count=511, max_size=1022).launch(share=True)

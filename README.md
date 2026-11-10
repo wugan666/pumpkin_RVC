@@ -214,6 +214,44 @@ python webui.py --noautoopen
 
 默认服务监听端口为 `7865`。用户自己的 `.pth` 模型放入 `assets/weights/`，`.index` 文件放入 `assets/indices/`。
 
+WebUI 默认监听所有网卡（`0.0.0.0`）。在公网服务器上只想本机访问时，设置 `RVC_WEBUI_HOST=127.0.0.1` 再启动。
+
+### 一键克隆音色
+
+WebUI 首页“一键克隆”把克隆流程收成三步：
+
+1. 填一个音色名称，上传（或直接用麦克风录制）目标人物的干净人声，建议总时长 1~10 分钟以上；素材很多时可以在“更多选项”里直接填文件夹路径。
+2. 选择训练质量后点“开始克隆”。程序会自动下载缺少的基础模型（HuBERT、RMVPE、v2 底模、mute 样本，约 500MB），然后依次完成切分、音高与特征提取、训练和索引。
+3. 训练完成后音色会自动出现在右侧“试听”、 “模型推理”页和实时变声的模型下拉框里，索引自动匹配。
+
+素材带伴奏或混响时，先在“人声伴奏分离&去混响”页处理再克隆。需要调整更多训练参数时仍可使用“训练”页。
+
+基础模型也可以用命令行提前下载（无法访问 Hugging Face 时会自动改用镜像，也可以用 `HF_ENDPOINT` 指定）：
+
+```bash
+python -m tools.download_models            # 推理 + v2 40k 训练所需
+python -m tools.download_models --check    # 只检查缺少哪些文件
+```
+
+### 实时变声
+
+```bash
+python realtime_gui.py
+```
+
+- “音色模型”下拉框列出 `assets/weights/` 里的模型，选择后自动匹配索引；索引是可选的。
+- “预设”提供低延迟 / 均衡 / 高音质三组采样长度与音高算法组合。
+- 状态栏显示输入/输出电平、推理时间和过载次数。**推理时间必须小于采样长度**，否则声音会断续——出现过载时加大采样长度或改用 fcpe。
+- “响应阈值”是噪声门：低于阈值的环境噪声不会被送去变声，说话停顿时输出保持安静。
+- “清辅音保护”在开启索引检索时保留清辅音和气声，减少咬字发糊。
+
+没有声卡也可以用文件验证实时效果，下面的命令走的是和 GUI 完全相同的逐块处理链路：
+
+```bash
+python -m infer.realtime_engine --model assets/weights/my_voice.pth \
+    --input in.wav --output out.wav --threshold -45
+```
+
 ## 参考项目
 + [ContentVec](https://github.com/auspicious3000/contentvec/)
 + [VITS](https://github.com/jaywalnut310/vits)

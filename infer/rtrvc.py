@@ -1,3 +1,4 @@
+import os
 import traceback
 from time import time as ttime
 import faiss
@@ -65,72 +66,113 @@ class RVC:
         index_rate,
         config,
         last_rvc=None,
+        protect=0.33,
     ) :
         """
         初始化
+
+        模型加载失败会直接抛出异常，由调用方（GUI）提示用户；索引是可选的，
+        缺失或损坏时只打印警告并在不使用检索的情况下继续。
         """
+        self.config = config
+        self.device = config.device
+        self.f0_up_key = key
+        self.formant_shift = formant
+        self.protect = protect
+        self.f0_min = 50
+        self.f0_max = 1100
+        self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
+        self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
+        self.is_half = config.is_half
+        self.pth_path = pth_path
+        self.index_path = index_path
+        self.index_rate = index_rate
+        self.index = None
+        self.big_npy = None
+        if (
+            last_rvc is not None
+            and getattr(last_rvc, "index", None) is not None
+            and last_rvc.index_path == index_path
+        ):
+            self.index = last_rvc.index
+            self.big_npy = last_rvc.big_npy
+        elif index_rate != 0:
+            self.load_index()
+        self.cache_pitch = torch.zeros(1024, device=self.device, dtype=torch.long)
+        self.cache_pitchf = torch.zeros(
+            1024, device=self.device, dtype=torch.float32
+        )
+        # Raw voiced/unvoiced decision per 10 ms frame, aligned with cache_pitch.
+        self.cache_voiced = torch.zeros(1024, device=self.device, dtype=torch.bool)
+        # Last voiced F0 (Hz, before transposition) seen by the extractor.
+        self.last_voiced_f0 = 0.0
+        self.infer_count = 0
+
+        self.resample_kernel = {}
+
+        if last_rvc is None:
+            self.model = load_hubert_model(self.device, self.is_half)
+        else:
+            self.model = last_rvc.model
+
+        self.net_g = None
+
+        def set_synthesizer():
+            self.net_g, cpt = get_synthesizer(self.pth_path, self.device)
+            self.tgt_sr = cpt["config"][-1]
+            cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
+            self.if_f0 = cpt.get("f0", 1)
+            self.version = cpt.get("version", "v1")
+            if self.is_half:
+                self.net_g = self.net_g.half()
+            else:
+                self.net_g = self.net_g.float()
+
+        if (
+            last_rvc is None
+            or last_rvc.pth_path != self.pth_path
+            or getattr(last_rvc, "net_g", None) is None
+        ):
+            set_synthesizer()
+        else:
+            self.tgt_sr = last_rvc.tgt_sr
+            self.if_f0 = last_rvc.if_f0
+            self.version = last_rvc.version
+            self.is_half = last_rvc.is_half
+            self.net_g = last_rvc.net_g
+
+        if last_rvc is not None and hasattr(last_rvc, "model_rmvpe"):
+            self.model_rmvpe = last_rvc.model_rmvpe
+        if last_rvc is not None and hasattr(last_rvc, "model_fcpe"):
+            self.model_fcpe = last_rvc.model_fcpe
+
+    def load_index(self):
+        """Load the optional faiss index. Returns True when it is usable."""
+        self.index = None
+        self.big_npy = None
+        if not self.index_path:
+            return False
+        if not os.path.isfile(self.index_path):
+            printt(i18n("索引文件不存在，将不使用索引继续推理：%s"), self.index_path)
+            return False
         try:
-            # global config
-            self.config = config
-            # device="cpu"########强制cpu测试
-            self.device = config.device
-            self.f0_up_key = key
-            self.formant_shift = formant
-            self.f0_min = 50
-            self.f0_max = 1100
-            self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
-            self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
-            self.is_half = config.is_half
-            if index_rate != 0:
-                self.index = faiss.read_index(index_path)
-                self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
-                printt(i18n("已启用索引检索"))
-            self.pth_path = pth_path
-            self.index_path = index_path
-            self.index_rate = index_rate
-            self.cache_pitch = torch.zeros(
-                1024, device=self.device, dtype=torch.long
-            )
-            self.cache_pitchf = torch.zeros(
-                1024, device=self.device, dtype=torch.float32
-            )
-            self.infer_count = 0
-
-            self.resample_kernel = {}
-
-            if last_rvc is None:
-                self.model = load_hubert_model(self.device, self.is_half)
-            else:
-                self.model = last_rvc.model
-
-            self.net_g = None
-
-            def set_synthesizer():
-                self.net_g, cpt = get_synthesizer(self.pth_path, self.device)
-                self.tgt_sr = cpt["config"][-1]
-                cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
-                self.if_f0 = cpt.get("f0", 1)
-                self.version = cpt.get("version", "v1")
-                if self.is_half:
-                    self.net_g = self.net_g.half()
-                else:
-                    self.net_g = self.net_g.float()
-
-            if last_rvc is None or last_rvc.pth_path != self.pth_path:
-                set_synthesizer()
-            else:
-                self.tgt_sr = last_rvc.tgt_sr
-                self.if_f0 = last_rvc.if_f0
-                self.version = last_rvc.version
-                self.is_half = last_rvc.is_half
-                self.net_g = last_rvc.net_g
-
-            if last_rvc is not None and hasattr(last_rvc, "model_rmvpe"):
-                self.model_rmvpe = last_rvc.model_rmvpe
-            if last_rvc is not None and hasattr(last_rvc, "model_fcpe"):
-                self.model_fcpe = last_rvc.model_fcpe
-        except:
+            index = faiss.read_index(self.index_path)
+            self.big_npy = index.reconstruct_n(0, index.ntotal)
+            self.index = index
+            printt(i18n("已启用索引检索"))
+            return True
+        except Exception:
             printt(traceback.format_exc())
+            printt(i18n("索引检索失败"))
+            return False
+
+    def reset_state(self):
+        """Forget the streaming history (pitch cache) before a new stream."""
+        self.cache_pitch.zero_()
+        self.cache_pitchf.zero_()
+        self.cache_voiced.zero_()
+        self.last_voiced_f0 = 0.0
+        self.infer_count = 0
 
     def change_key(self, new_key):
         self.f0_up_key = new_key
@@ -139,11 +181,33 @@ class RVC:
         self.formant_shift = new_formant
 
     def change_index_rate(self, new_index_rate):
-        if new_index_rate != 0 and self.index_rate == 0:
-            self.index = faiss.read_index(self.index_path)
-            self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
-            printt(i18n("已启用索引检索"))
+        if new_index_rate != 0 and self.index is None:
+            self.load_index()
         self.index_rate = new_index_rate
+
+    def change_protect(self, new_protect):
+        self.protect = new_protect
+
+    def finalize_f0(self, f0, f0_up_key):
+        """Fill unvoiced frames the way training does, then transpose.
+
+        Training interpolates F0 across unvoiced frames, so the synthesizer has
+        rarely seen F0 == 0 next to speech. A streaming window that happens to
+        contain no voiced frame at all (a pause, a long consonant) would feed it
+        exactly that, which is heard as a rough/hoarse burst. Holding the last
+        voiced pitch keeps the input in-distribution.
+        """
+        f0 = np.array(f0, dtype=np.float32).reshape(-1)
+        voiced = f0 > 0
+        if voiced.any():
+            voiced_idx = np.where(voiced)[0]
+            f0[~voiced] = np.interp(np.where(~voiced)[0], voiced_idx, f0[voiced])
+            self.last_voiced_f0 = float(f0[voiced_idx[-1]])
+        elif self.last_voiced_f0 > 0:
+            f0[:] = self.last_voiced_f0
+        f0 *= pow(2, f0_up_key / 12)
+        coarse, f0 = self.get_f0_post(f0)
+        return coarse, f0, torch.from_numpy(voiced).to(self.device)
 
     def get_f0_post(self, f0):
         if not torch.is_tensor(f0):
@@ -181,11 +245,7 @@ class RVC:
         if len(f0) < p_len:
             f0 = np.pad(f0, (0, p_len - len(f0)))
         f0 = f0[:p_len]
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
-        f0 *= pow(2, f0_up_key / 12)
-        return self.get_f0_post(f0)
+        return self.finalize_f0(f0, f0_up_key)
 
     def get_f0_rmvpe(self, x, f0_up_key):
         if hasattr(self, "model_rmvpe") == False:
@@ -198,11 +258,7 @@ class RVC:
                 device=self.device,
             )
         f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
-        f0 *= pow(2, f0_up_key / 12)
-        return self.get_f0_post(f0)
+        return self.finalize_f0(f0, f0_up_key)
 
     def get_f0_fcpe(self, x, f0_up_key):
         if hasattr(self, "model_fcpe") == False:
@@ -216,11 +272,7 @@ class RVC:
             decoder_mode="local_argmax",
             threshold=0.006,
         ).squeeze().detach().cpu().numpy()
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
-        f0 *= pow(2, f0_up_key / 12)
-        return self.get_f0_post(f0)
+        return self.finalize_f0(f0, f0_up_key)
 
     def infer(
         self,
@@ -247,8 +299,11 @@ class RVC:
             )
             feats = torch.cat((feats, feats[:, -1:, :]), 1)
         t2 = ttime()
+        feats0 = None
         try:
-            if hasattr(self, "index") and self.index_rate != 0:
+            if self.index is not None and self.index_rate != 0:
+                if self.if_f0 == 1 and self.protect < 0.5:
+                    feats0 = feats.clone()
                 npy = feats[0][skip_head // 2 :].cpu().numpy().astype("float32")
                 score, ix = self.index.search(npy, k=8)
                 if (ix >= 0).all():
@@ -282,7 +337,7 @@ class RVC:
             f0_extractor_frame = block_frame_16k + 800
             if f0method == "rmvpe":
                 f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
-            pitch, pitchf = self.get_f0(
+            pitch, pitchf, voiced = self.get_f0(
                 input_wav[-f0_extractor_frame:],
                 self.f0_up_key - self.formant_shift,
                 f0method,
@@ -290,13 +345,28 @@ class RVC:
             shift = block_frame_16k // 160
             self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
             self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
+            self.cache_voiced[:-shift] = self.cache_voiced[shift:].clone()
             self.cache_pitch[4 - pitch.shape[0] :] = pitch[3:-1]
             self.cache_pitchf[4 - pitch.shape[0] :] = pitchf[3:-1]
+            self.cache_voiced[4 - pitch.shape[0] :] = voiced[3:-1]
             cache_pitch = self.cache_pitch[None, -p_len:]
             cache_pitchf = self.cache_pitchf[None, -p_len:] * return_length2 / return_length
         t4 = ttime()
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         feats = feats[:, :p_len, :]
+        if feats0 is not None:
+            # Protect voiceless consonants and breaths: retrieval tends to smear
+            # them into the nearest voiced timbre, so keep more of the source
+            # features on frames the pitch tracker marked unvoiced.
+            feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
+                0, 2, 1
+            )[:, :p_len, :]
+            keep = torch.where(
+                self.cache_voiced[-p_len:],
+                torch.ones((), device=self.device),
+                torch.full((), float(self.protect), device=self.device),
+            ).to(feats.dtype)[None, :, None]
+            feats = feats * keep + feats0 * (1 - keep)
         p_len_tensor = torch.LongTensor([p_len]).to(self.device)
         sid = torch.LongTensor([0]).to(self.device)
         skip_head_value = int(skip_head)

@@ -1,6 +1,14 @@
 import os
+import sys
 import logging
 import warnings
+
+# Launched as "python train/train.py", Python puts train/ first on sys.path,
+# where this very file shadows the `train` package and `from train import
+# utils` becomes a circular import. Point that entry at the project root.
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if sys.path and os.path.abspath(sys.path[0]) == _script_dir:
+    sys.path[0] = os.path.dirname(_script_dir)
 
 warnings.filterwarnings(
     "ignore",
@@ -158,7 +166,10 @@ def main():
 def run(rank, n_gpus, hps, logger, use_ddp):
     global global_step
     if rank == 0:
-        # logger = utils.get_logger(hps.model_dir)
+        # A logger handed to a spawned worker arrives without its handlers, so
+        # CPU and multi-GPU runs would otherwise write nothing to train.log.
+        if not logger.handlers:
+            logger = utils.get_logger(hps.model_dir)
         logger.info(hps)
         # utils.check_git_hash(hps.model_dir)
         writer = SummaryWriter(log_dir=hps.model_dir)
