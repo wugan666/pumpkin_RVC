@@ -57,7 +57,7 @@ class RealtimeSettings:
         self.crossfade_time = 0.05
         self.extra_time = 2.5
         # Seconds HuBERT re-encodes per block (rest is cached); 0 = everything.
-        self.hubert_context = 1.0
+        self.hubert_context = 2.0
         self.threhold = GATE_OFF_DB  # (live) noise gate threshold in dB
         # (live) derive the threshold from the measured background noise
         self.auto_threshold = False

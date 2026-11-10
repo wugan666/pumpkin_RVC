@@ -119,7 +119,7 @@ class RVC:
         self.infer_count = 0
         # Seconds of audio re-encoded by HuBERT ahead of each new block; the
         # rest of the window comes from the feature cache. 0 disables caching.
-        self.hubert_context = 1.0
+        self.hubert_context = 2.0
         self.feat_cache = None
         self.feat_cache_key = None
         # HuBERT feature of digital silence, used to advance the cache while

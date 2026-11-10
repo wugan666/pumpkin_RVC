@@ -103,7 +103,7 @@ if __name__ == "__main__":
     # the whole window every time (slowest, marginally closer to offline).
     PRESETS = {
         "preset_fast": (0.10, 0.04, 1.5, "fcpe", 0.5),
-        "preset_balanced": (0.24, 0.05, 2.5, "rmvpe", 1.0),
+        "preset_balanced": (0.24, 0.05, 2.5, "rmvpe", 2.0),
         "preset_quality": (0.50, 0.08, 3.0, "rmvpe", 0.0),
     }
     DEFAULTS = {
@@ -129,7 +129,7 @@ if __name__ == "__main__":
         "block_time": 0.25,
         "crossfade_length": 0.05,
         "extra_time": 2.5,
-        "hubert_context": 1.0,
+        "hubert_context": 2.0,
         "f0method": "rmvpe",
         "I_noise_reduce": False,
         "O_noise_reduce": False,
