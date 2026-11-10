@@ -362,5 +362,9 @@
     "自动变调（推荐，自动把你的音高对到该音色）": "Auto pitch (recommended: moves your pitch into this voice's range)",
     "自动选择采样长度（启动时实测本机速度）": "Choose the sample length automatically (timed on this machine at start)",
     "该模型没有音高统计，已使用手动变调": "this model has no pitch statistics; the manual transpose was used",
-    "运行中 · 该模型没有音高统计，请手动设置音调": "Running · this model has no pitch statistics, set the pitch manually"
+    "运行中 · 该模型没有音高统计，请手动设置音调": "Running · this model has no pitch statistics, set the pitch manually",
+    "自动": "Auto",
+    "待机 · 未说话（不占用显卡）": "Standby · not speaking (GPU left free)",
+    "显卡繁忙，已自动把采样长度加大到 %.2f 秒": "GPU busy: sample length automatically increased to %.2f s",
+    "未检测到虚拟声卡：要让队友听到变声，请先安装 VB-CABLE（见 README）": "No virtual audio cable found: install VB-CABLE so others can hear the converted voice (see README)"
 }

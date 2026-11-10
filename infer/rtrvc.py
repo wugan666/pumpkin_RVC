@@ -122,6 +122,9 @@ class RVC:
         self.hubert_context = 1.0
         self.feat_cache = None
         self.feat_cache_key = None
+        # HuBERT feature of digital silence, used to advance the cache while
+        # the input is gated and no model runs (see skip_block).
+        self.silence_feat = None
         # Automatic transposition: voiced source F0 seen so far (Hz, one value
         # per 10 ms frame) is compared with the model's training-set median.
         self.auto_pitch = False
@@ -201,6 +204,39 @@ class RVC:
         self.source_f0.clear()
         self.auto_pitch_locked = False
         self.auto_key = None
+
+    def prepare_silence(self):
+        """Encode silence once so skip_block can extend the feature cache."""
+        with torch.no_grad():
+            feats = self._hubert(torch.zeros(16000, device=self.device))
+        self.silence_feat = feats[0].mean(dim=0)
+
+    def skip_block(self, block_frame_16k):
+        """Advance the streaming state by one silent block without running
+        HuBERT, the pitch tracker or the synthesizer.
+
+        Used while the noise gate is closed: the output is muted anyway, so the
+        only thing that matters is that the caches look, at the next word, as
+        if silence had been processed.
+        """
+        shift = block_frame_16k // 160
+        for cache in (self.cache_pitch, self.cache_pitchf, self.cache_voiced):
+            cache[:-shift] = cache[shift:].clone()
+        # finalize_f0 holds the last voiced pitch through silence; so do we.
+        self.cache_pitch[-shift:] = self.cache_pitch[-shift - 1].clone()
+        self.cache_pitchf[-shift:] = self.cache_pitchf[-shift - 1].clone()
+        self.cache_voiced[-shift:] = False
+        frames = block_frame_16k // HUBERT_HOP
+        if (
+            self.feat_cache is not None
+            and self.silence_feat is not None
+            and block_frame_16k % HUBERT_HOP == 0
+            and self.silence_feat.shape[0] == self.feat_cache.shape[2]
+        ):
+            self.feat_cache = torch.roll(self.feat_cache, -frames, dims=1)
+            self.feat_cache[:, -frames:] = self.silence_feat.to(self.feat_cache.dtype)
+        else:
+            self.feat_cache = None
 
     def update_auto_pitch(self):
         """Derive the transposition from the speaker's own pitch.

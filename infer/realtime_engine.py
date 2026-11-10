@@ -29,6 +29,12 @@ GATE_PREROLL_HOPS = 2  # re-open this much audio before the detected onset
 GATE_OUTPUT_SPREAD_HOPS = 5  # the output mute is this much wider than the gate
 GATE_OFF_DB = -60  # slider minimum: gate disabled
 
+# Automatic threshold: this far above the measured background level.
+AUTO_GATE_MARGIN_DB = 8.0
+AUTO_GATE_RANGE_DB = (-55.0, -30.0)
+AUTO_GATE_HISTORY_HOPS = 3000  # 30 s of level history
+AUTO_GATE_MIN_HOPS = 100  # history needed before the estimate is used
+
 # Loudness matching may not boost the model output by more than this factor.
 MAX_ENVELOPE_GAIN = 6.0
 LIMITER_KNEE = 0.85
@@ -46,6 +52,10 @@ class RealtimeSettings:
         # Seconds HuBERT re-encodes per block (rest is cached); 0 = everything.
         self.hubert_context = 1.0
         self.threhold = GATE_OFF_DB  # (live) noise gate threshold in dB
+        # (live) derive the threshold from the measured background noise
+        self.auto_threshold = False
+        # (live) run no model at all while the gate is closed
+        self.idle_skip = True
         self.I_noise_reduce = False  # (live)
         self.O_noise_reduce = False  # (live)
         self.rms_mix_rate = 0.0  # (live)
@@ -143,6 +153,8 @@ class RealtimeEngine:
 
         self.gate_tail = np.zeros(3 * self.zc, dtype=np.float32)
         self.gate_hold = 0
+        self.level_history = np.zeros(0, dtype=np.float32)
+        self.auto_threshold_db = None
         # Gain at the end of each of the most recent hops (oldest first).
         self.gate_history = np.zeros(GATE_PREROLL_HOPS + 1, dtype=np.float32)
         # Read by the GUI thread; plain values so no locking is needed.
@@ -155,6 +167,9 @@ class RealtimeEngine:
             "gate_open": True,
             "sola_offset": 0,
             "auto_key": None,  # transposition chosen by auto pitch, if any
+            "threshold": None,  # gate threshold in use when it is automatic
+            "idle": False,  # True while the gate is closed and models are skipped
+            "idle_blocks": 0,
         }
 
     def _frames(self, seconds):
@@ -181,6 +196,8 @@ class RealtimeEngine:
         self.gate_tail[:] = 0
         self.gate_hold = 0
         self.gate_history[:] = 0
+        self.level_history = np.zeros(0, dtype=np.float32)
+        self.auto_threshold_db = None
         self.rvc.reset_state()
 
     def prewarm(self):
@@ -205,6 +222,10 @@ class RealtimeEngine:
             if self.cfg.I_noise_reduce:
                 short = self.input_wav[-self.sola_buffer_frame - self.block_frame :]
                 self.tg(short.unsqueeze(0), self.input_wav.unsqueeze(0))
+            self.rvc.prepare_silence()
+            inferred = self._convert()
+            # The second pass takes the cached-feature path, whose tensor
+            # shapes differ; warm it too so the first live block is not slow.
             inferred = self._convert()
             if self.cfg.O_noise_reduce:
                 self.tg(inferred.unsqueeze(0), self.output_buffer.unsqueeze(0))
@@ -231,6 +252,9 @@ class RealtimeEngine:
         threshold = self.cfg.threhold
         zc = self.zc
         pre = GATE_PREROLL_HOPS
+        if self.cfg.auto_threshold:
+            threshold = self._auto_threshold(block, threshold)
+        self.stats["threshold"] = threshold if self.cfg.auto_threshold else None
         if threshold <= GATE_OFF_DB:
             self.gate_history[:] = 1.0
             self.gate_hold = 0
@@ -273,6 +297,24 @@ class RealtimeEngine:
             np.arange(covered * zc) / zc, np.arange(covered + 1), gains
         ).astype(np.float32)
         return joined[-covered * zc :] * envelope, envelope
+
+    def _auto_threshold(self, block, fallback):
+        """Gate threshold that follows the room: a fixed margin above the
+        background level, taken as the 10th percentile of the last 30 s (speech
+        sits far above that as long as the speaker pauses now and then)."""
+        zc = self.zc
+        hops = block[: block.shape[0] // zc * zc].reshape(-1, zc).astype(np.float64)
+        level = 10 * np.log10((hops**2).mean(axis=1) + 1e-12)
+        self.level_history = np.concatenate((self.level_history, level))[
+            -AUTO_GATE_HISTORY_HOPS:
+        ].astype(np.float32)
+        if self.level_history.shape[0] >= AUTO_GATE_MIN_HOPS:
+            floor = float(np.percentile(self.level_history, 10))
+            low, high = AUTO_GATE_RANGE_DB
+            self.auto_threshold_db = min(high, max(low, floor + AUTO_GATE_MARGIN_DB))
+        if self.auto_threshold_db is None:
+            return fallback if fallback > GATE_OFF_DB else AUTO_GATE_RANGE_DB[0]
+        return self.auto_threshold_db
 
     def _rms(self, wav):
         """Frame RMS matching librosa.feature.rms(frame=4*zc, hop=zc)."""
@@ -349,8 +391,25 @@ class RealtimeEngine:
         )[160:]
         source = self.input_wav_denoise if cfg.I_noise_reduce else self.input_wav
         source = source[self.extra_frame :]
+        # While the gate is closed across everything this block could output,
+        # the result is muted anyway: skip all models and leave the GPU alone.
+        spread = GATE_OUTPUT_SPREAD_HOPS * self.zc
+        idle = (
+            converting
+            and cfg.idle_skip
+            and envelope is not None
+            and float(self.gate_env[max(0, self.extra_frame - spread) :].max()) == 0.0
+        )
+        self.stats["idle"] = idle
         # infer
-        if converting:
+        if idle:
+            self.rvc.skip_block(self.block_frame_16k)
+            self.stats["idle_blocks"] += 1
+            infer_wav = torch.zeros(
+                self.return_length * self.zc, device=self.device, dtype=torch.float32
+            )
+            converting = False
+        elif converting:
             self.rvc.auto_pitch = bool(cfg.auto_pitch)
             infer_wav = self._convert()
             self.stats["auto_key"] = self.rvc.auto_key if cfg.auto_pitch else None
@@ -374,7 +433,6 @@ class RealtimeEngine:
             # Whatever the model produces well inside a closed gate is noise.
             # The mute is wider than the gate so soft onsets and tails survive.
             if envelope is not None:
-                spread = GATE_OUTPUT_SPREAD_HOPS * self.zc
                 mute = F.max_pool1d(
                     self.gate_env[None, None, self.extra_frame :],
                     2 * spread + 1,
@@ -482,6 +540,8 @@ def main():
     parser.add_argument("--protect", type=float, default=0.33)
     parser.add_argument("--rms-mix-rate", type=float, default=0.0)
     parser.add_argument("--threshold", type=float, default=GATE_OFF_DB)
+    parser.add_argument("--auto-threshold", action="store_true")
+    parser.add_argument("--no-idle-skip", action="store_true")
     parser.add_argument("--f0method", default="rmvpe", choices=("pm", "rmvpe", "fcpe"))
     parser.add_argument("--block-time", type=float, default=0.25)
     parser.add_argument(
@@ -516,6 +576,8 @@ def main():
     cfg.protect = args.protect
     cfg.rms_mix_rate = args.rms_mix_rate
     cfg.threhold = args.threshold
+    cfg.auto_threshold = args.auto_threshold
+    cfg.idle_skip = not args.no_idle_skip
     cfg.f0method = args.f0method
     cfg.block_time = args.block_time
     cfg.crossfade_time = args.crossfade_time
@@ -550,9 +612,11 @@ def main():
         print("auto pitch: %s (model median F0: %s)" % (rvc.auto_key, rvc.f0_median))
     block_ms = 1000 * engine.block_frame / engine.samplerate
     print(
-        "blocks=%d block=%.0fms infer mean=%.0fms max=%.0fms overruns=%d delay=%.0fms"
+        "blocks=%d idle=%d threshold=%s block=%.0fms infer mean=%.0fms max=%.0fms overruns=%d delay=%.0fms"
         % (
             len(times),
+            engine.stats["idle_blocks"],
+            engine.stats["threshold"],
             block_ms,
             float(np.mean(times)),
             float(np.max(times)),

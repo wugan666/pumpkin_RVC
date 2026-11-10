@@ -28,6 +28,7 @@ def printt(strr, *args):
 if __name__ == "__main__":
     import gc
     import json
+    from collections import deque
     import re
     import time
     import traceback
@@ -45,7 +46,37 @@ if __name__ == "__main__":
         RealtimeSettings,
         auto_block_engine,
     )
+    from infer.realtime_engine import AUTO_BLOCK_TIMES
+    from tools.audio_devices import (
+        find_virtual_cable,
+        is_virtual_input,
+        match_device,
+        preferred_hostapi,
+    )
     from tools.download_models import download_assets, inference_assets
+
+    IS_WINDOWS = sys.platform == "win32"
+    # A game will take most of the GPU once it runs, so the block length is
+    # chosen with this much of each block left spare.
+    AUTO_BLOCK_HEADROOM = 0.5
+    # This many late blocks within ADAPT_WINDOW seconds lengthen the block.
+    ADAPT_OVERRUNS = 3
+    ADAPT_WINDOW = 5.0
+
+    def raise_process_priority():
+        """Keep audio flowing while a game saturates the CPU (Windows only)."""
+        if not IS_WINDOWS:
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+            kernel32.SetPriorityClass(
+                kernel32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS
+            )
+        except Exception:
+            printt(traceback.format_exc())
     from infer.vc.utils import get_index_path_from_model
     from i18n.i18n import I18nAuto
 
@@ -84,6 +115,7 @@ if __name__ == "__main__":
         "sg_output_device": "",
         "sr_type": "sr_model",
         "threhold": -55,
+        "auto_threshold": True,
         "auto_pitch": True,
         "auto_block": True,
         "show_advanced": False,
@@ -144,19 +176,37 @@ if __name__ == "__main__":
             self.shown_overruns = 0
             self.overrun_time = float("-inf")
             self.auto_block = True
+            self.shown_threshold = None
+            self.notice = ""
+            self.notice_time = float("-inf")
+            self.overrun_marks = deque([(0.0, 0)])
             self.auto_pitch_unavailable = False
             self.show_advanced = False
+            raise_process_priority()
             self.update_devices()
             self.launcher()
 
         def default_device(self, kind):
+            """Best first-run choice: the virtual cable for output when there
+            is one, otherwise the system default device (found by name, since
+            its index belongs to the default host API)."""
             names = self.input_devices if kind == 0 else self.output_devices
             indices = (
                 self.input_devices_indices if kind == 0 else self.output_devices_indices
             )
+            if kind == 1 and find_virtual_cable(names):
+                return find_virtual_cable(names)
             if sd.default.device[kind] in indices:
                 return names[indices.index(sd.default.device[kind])]
-            return names[0] if names else ""
+            try:
+                system_name = sd.query_devices(device=sd.default.device[kind])["name"]
+            except Exception:
+                system_name = ""
+            matched = match_device(system_name, names)
+            if matched:
+                return matched
+            real = [name for name in names if kind == 1 or not is_virtual_input(name)]
+            return (real or names or [""])[0]
 
         def load(self):
             data = dict(DEFAULTS)
@@ -175,8 +225,8 @@ if __name__ == "__main__":
                 or data["sg_input_device"] not in self.input_devices
                 or data["sg_output_device"] not in self.output_devices
             ):
-                self.update_devices()
-                data["sg_hostapi"] = self.hostapis[0] if self.hostapis else ""
+                data["sg_hostapi"] = preferred_hostapi(self.hostapis, IS_WINDOWS)
+                self.update_devices(hostapi_name=data["sg_hostapi"])
                 data["sg_input_device"] = self.default_device(0)
                 data["sg_output_device"] = self.default_device(1)
             # A remembered model that has since been moved or deleted would only
@@ -329,7 +379,16 @@ if __name__ == "__main__":
                 expand_x=True,
                 expand_y=True,
                 layout=[
-                    [label("响应阈值"), slider("threhold", (-60, 0), 1)],
+                    [
+                        label("响应阈值"),
+                        sg.Checkbox(
+                            i18n("自动"),
+                            key="auto_threshold",
+                            default=data["auto_threshold"],
+                            enable_events=True,
+                        ),
+                        slider("threhold", (-60, 0), 1),
+                    ],
                     [label("性别因子/声线粗细"), slider("formant", (-2, 2), 0.05)],
                     [label("Index Rate"), slider("index_rate", (0.0, 1.0), 0.01)],
                     [label("清辅音保护"), slider("protect", (0.0, 0.5), 0.01)],
@@ -467,6 +526,11 @@ if __name__ == "__main__":
             self.window = sg.Window(
                 i18n("RVC 实时变声"), layout=layout, finalize=True, resizable=True
             )
+            if IS_WINDOWS and not find_virtual_cable(self.output_devices):
+                self.set_status(
+                    i18n("未检测到虚拟声卡：要让队友听到变声，请先安装 VB-CABLE（见 README）"),
+                    COLOR_WARN,
+                )
             self.event_handler()
 
         # ----------------------------------------------------------- events
@@ -488,6 +552,12 @@ if __name__ == "__main__":
             settings = {key: values[key] for key in DEFAULTS if key in values}
             settings["hubert_context"] = self.gui_config.hubert_context
             settings["show_advanced"] = self.show_advanced
+            # The devices in use can differ from the form after an MME fallback.
+            cfg = self.gui_config
+            if cfg.sg_hostapi:
+                settings["sg_hostapi"] = cfg.sg_hostapi
+                settings["sg_input_device"] = cfg.sg_input_device
+                settings["sg_output_device"] = cfg.sg_output_device
             settings["sr_type"] = "sr_model" if values["sr_model"] else "sr_device"
             settings["f0method"] = next(
                 (name for name in F0_METHODS if values[name]), "rmvpe"
@@ -514,14 +584,34 @@ if __name__ == "__main__":
             if auto_key is not None and auto_key != self.gui_config.pitch:
                 self.gui_config.pitch = auto_key
                 self.window["pitch"].update(auto_key)
+            threshold = stats["threshold"]
+            if threshold is not None and round(threshold) != self.shown_threshold:
+                self.shown_threshold = round(threshold)
+                self.window["threhold"].update(self.shown_threshold)
+            now = time.monotonic()
             if stats["overruns"] > self.shown_overruns:
                 self.shown_overruns = stats["overruns"]
-                self.overrun_time = time.monotonic()
-            # Keep the warning up long enough to be read.
-            if time.monotonic() - self.overrun_time < 3:
+                self.overrun_time = now
+            # A game that starts later takes GPU time away: when blocks keep
+            # arriving late, lengthen them instead of letting the voice stutter.
+            self.overrun_marks.append((now, stats["overruns"]))
+            while now - self.overrun_marks[0][0] > ADAPT_WINDOW:
+                self.overrun_marks.popleft()
+            if (
+                self.auto_block
+                and stats["overruns"] - self.overrun_marks[0][1] >= ADAPT_OVERRUNS
+                and self.grow_block()
+            ):
+                return
+            # Keep notices up long enough to be read.
+            if now - self.notice_time < 4:
+                self.set_status(self.notice, COLOR_WARN)
+            elif now - self.overrun_time < 3:
                 self.set_status(
                     i18n("过载：推理慢于采样长度，请加大采样长度"), COLOR_BAD
                 )
+            elif stats["idle"]:
+                self.set_status(i18n("待机 · 未说话（不占用显卡）"), COLOR_IDLE)
             elif not stats["gate_open"]:
                 self.set_status(i18n("运行中 · 静音(低于响应阈值)"), COLOR_WARN)
             elif self.auto_pitch_unavailable and self.gui_config.auto_pitch:
@@ -530,6 +620,33 @@ if __name__ == "__main__":
                 )
             else:
                 self.set_status(i18n("运行中"), COLOR_OK)
+
+        def grow_block(self):
+            """Switch to the next longer block length. Returns False when the
+            longest one is already in use."""
+            cfg = self.gui_config
+            longer = [t for t in AUTO_BLOCK_TIMES if t > cfg.block_time + 1e-6]
+            if not longer:
+                return False
+            self.stop_stream()
+            cfg.block_time = longer[0]
+            self.engine = RealtimeEngine(
+                self.rvc, cfg, self.config.device, cfg.samplerate
+            )
+            self.engine.prewarm()
+            self.open_stream()
+            self.window["block_time"].update(cfg.block_time)
+            self.update_delay()
+            self.reset_run_state()
+            self.notice = i18n("显卡繁忙，已自动把采样长度加大到 %.2f 秒") % cfg.block_time
+            self.notice_time = time.monotonic()
+            printt(self.notice)
+            return True
+
+        def reset_run_state(self):
+            self.shown_overruns = 0
+            self.overrun_time = float("-inf")
+            self.overrun_marks = deque([(time.monotonic(), 0)])
 
         def update_delay(self):
             if self.stream is None or self.engine is None:
@@ -614,8 +731,7 @@ if __name__ == "__main__":
                             )
                             continue
                         self.save_settings(values)
-                        self.shown_overruns = 0
-                        self.overrun_time = float("-inf")
+                        self.reset_run_state()
                         self.set_running(True)
                         self.set_status(i18n("运行中"), COLOR_OK)
                         self.window["sr_stream"].update(self.gui_config.samplerate)
@@ -626,7 +742,12 @@ if __name__ == "__main__":
                     self.set_status(i18n("已停止"))
                 # Parameter hot update
                 elif event == "threhold":
+                    # Moving the slider by hand takes over from the automatic one.
                     self.gui_config.threhold = values["threhold"]
+                    self.gui_config.auto_threshold = False
+                    self.window["auto_threshold"].update(False)
+                elif event == "auto_threshold":
+                    self.gui_config.auto_threshold = values["auto_threshold"]
                 elif event == "toggle_advanced":
                     self.show_advanced = not self.show_advanced
                     self.window["advanced"].update(visible=self.show_advanced)
@@ -709,6 +830,7 @@ if __name__ == "__main__":
             cfg.index_path = index_path
             cfg.sr_type = settings["sr_type"]
             cfg.threhold = values["threhold"]
+            cfg.auto_threshold = values["auto_threshold"]
             cfg.pitch = values["pitch"]
             cfg.auto_pitch = values["auto_pitch"]
             self.auto_block = values["auto_block"]
@@ -751,9 +873,25 @@ if __name__ == "__main__":
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            self.build_engine()
+            try:
+                self.start_stream()
+            except Exception as error:
+                # WASAPI refuses e.g. a microphone and an output that run at
+                # different rates. MME is slower but converts anything.
+                failed_hostapi = cfg.sg_hostapi
+                if not self.fallback_hostapi():
+                    raise
+                printt("%s -> %s (%s)", failed_hostapi, cfg.sg_hostapi, error)
+                self.build_engine()
+                self.start_stream()
+
+        def build_engine(self):
+            cfg = self.gui_config
+            # Shared-mode WASAPI only opens a device at its own sample rate.
             cfg.samplerate = (
                 self.rvc.tgt_sr
-                if cfg.sr_type == "sr_model"
+                if cfg.sr_type == "sr_model" and "WASAPI" not in cfg.sg_hostapi
                 else self.get_device_samplerate()
             )
             cfg.channels = self.get_device_channels()
@@ -764,7 +902,11 @@ if __name__ == "__main__":
                 self.set_status(i18n("正在测试本机速度…"), COLOR_WARN)
                 self.window.refresh()
                 self.engine, block_time, cost = auto_block_engine(
-                    self.rvc, cfg, self.config.device, cfg.samplerate
+                    self.rvc,
+                    cfg,
+                    self.config.device,
+                    cfg.samplerate,
+                    headroom=AUTO_BLOCK_HEADROOM,
                 )
                 printt("auto block: %.2fs (%.0f ms per block)", block_time, cost)
                 self.window["block_time"].update(block_time)
@@ -773,28 +915,58 @@ if __name__ == "__main__":
                     self.rvc, cfg, self.config.device, cfg.samplerate
                 )
                 self.engine.prewarm()
-            self.start_stream()
+
+        def fallback_hostapi(self):
+            """Re-select the same devices under MME. False when not possible."""
+            cfg = self.gui_config
+            mme = next((name for name in self.hostapis if "MME" in name), "")
+            if not mme or mme == cfg.sg_hostapi:
+                return False
+            wanted_in, wanted_out = cfg.sg_input_device, cfg.sg_output_device
+            self.update_devices(hostapi_name=mme)
+            cfg.sg_hostapi = mme
+            cfg.sg_input_device = (
+                match_device(wanted_in, self.input_devices) or self.default_device(0)
+            )
+            cfg.sg_output_device = (
+                match_device(wanted_out, self.output_devices) or self.default_device(1)
+            )
+            if not cfg.sg_input_device or not cfg.sg_output_device:
+                return False
+            self.window["sg_hostapi"].Update(values=self.hostapis, value=mme)
+            self.window["sg_input_device"].Update(
+                values=self.input_devices, value=cfg.sg_input_device
+            )
+            self.window["sg_output_device"].Update(
+                values=self.output_devices, value=cfg.sg_output_device
+            )
+            self.set_devices(cfg.sg_input_device, cfg.sg_output_device)
+            return True
 
         def start_stream(self):
             global flag_vc
             if not flag_vc:
-                if (
-                    "WASAPI" in self.gui_config.sg_hostapi
-                    and self.gui_config.sg_wasapi_exclusive
-                ):
-                    extra_settings = sd.WasapiSettings(exclusive=True)
-                else:
-                    extra_settings = None
-                self.stream = sd.Stream(
-                    callback=self.audio_callback,
-                    blocksize=self.engine.block_frame,
-                    samplerate=self.gui_config.samplerate,
-                    channels=self.gui_config.channels,
-                    dtype="float32",
-                    extra_settings=extra_settings,
-                )
-                self.stream.start()
-                flag_vc = True
+                self.open_stream()
+
+        def open_stream(self):
+            global flag_vc
+            if (
+                "WASAPI" in self.gui_config.sg_hostapi
+                and self.gui_config.sg_wasapi_exclusive
+            ):
+                extra_settings = sd.WasapiSettings(exclusive=True)
+            else:
+                extra_settings = None
+            self.stream = sd.Stream(
+                callback=self.audio_callback,
+                blocksize=self.engine.block_frame,
+                samplerate=self.gui_config.samplerate,
+                channels=self.gui_config.channels,
+                dtype="float32",
+                extra_settings=extra_settings,
+            )
+            self.stream.start()
+            flag_vc = True
 
         def stop_stream(self):
             global flag_vc
