@@ -368,5 +368,6 @@
     "显卡繁忙，已自动把采样长度加大到 %.2f 秒": "GPU busy: sample length automatically increased to %.2f s",
     "未检测到虚拟声卡：要让队友听到变声，请先安装 VB-CABLE（见 README）": "No virtual audio cable found: install VB-CABLE so others can hear the converted voice (see README)",
     "麦克风输入过载（削波）：请调低麦克风音量或离麦克风远一点": "Microphone overload (clipping): lower the microphone volume or move away from it",
-    "打开软件后自动开始": "Start automatically when the program opens"
+    "打开软件后自动开始": "Start automatically when the program opens",
+    "总训练轮数": "Total training epochs"
 }

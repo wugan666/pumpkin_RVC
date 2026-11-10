@@ -1794,7 +1794,12 @@ def clone_voice(name, files, recording, folder, preset, sr, batch_size, cleanup=
         return
 
     presets = dict(zip(clone_preset_choices(), CLONE_PRESETS.values()))
-    total_epoch = presets.get(preset, 50)
+    total_epoch = voice_clone.plan_epochs(
+        presets.get(preset, 50), seconds, int(batch_size)
+    )
+    summary += "\n%s：%d" % (i18n("总训练轮数"), total_epoch)
+    # Small datasets fit in video memory, which removes the disk reads per step.
+    cache_gpu = bool(gpus) and 0 < seconds <= voice_clone.GPU_CACHE_SECONDS
     pretrained_g, pretrained_d = get_pretrained_models("_v2", "f0", sr)
     status = ""
     for status, _, _, _ in train1key(
@@ -1812,7 +1817,7 @@ def clone_voice(name, files, recording, folder, preset, sr, batch_size, cleanup=
         pretrained_g,
         pretrained_d,
         gpus,
-        i18n("否"),
+        i18n("是") if cache_gpu else i18n("否"),
         i18n("否"),
         "v2",
         feature_gpus,

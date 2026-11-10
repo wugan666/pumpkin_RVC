@@ -126,6 +126,30 @@ def describe_dataset(count, seconds):
     return text
 
 
+# ---------------------------------------------------------------- epochs
+
+# Training slices the material into pieces; about this many reach each epoch
+# per second of audio (measured: 36 of 60 s at batch size 4).
+SEGMENTS_PER_SECOND = 0.6
+# With little material an epoch is only a few steps, so a fixed epoch count
+# under-trains. On a 1 minute clone the similarity to the real voice kept
+# rising up to roughly 360 steps and was flat after that.
+MIN_STEPS = 400
+MAX_EPOCH_FACTOR = 4
+GPU_CACHE_SECONDS = 600
+
+
+def plan_epochs(preset_epochs, seconds, batch_size):
+    """Epoch count for a preset, raised when the material is short."""
+    if seconds <= 0:
+        return preset_epochs
+    steps_per_epoch = max(1, int(seconds * SEGMENTS_PER_SECOND / max(1, batch_size)))
+    # the quick preset stays quick: it gets a proportionally smaller floor
+    steps = MIN_STEPS * min(preset_epochs, 50) // 50
+    needed = -(-steps // steps_per_epoch)
+    return int(min(max(preset_epochs, needed), preset_epochs * MAX_EPOCH_FACTOR))
+
+
 # ---------------------------------------------------------------- quality
 
 # Seconds analysed per file; enough to judge the recording conditions.
