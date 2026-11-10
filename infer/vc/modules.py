@@ -126,6 +126,8 @@ class VC:
                 clear_cuda_graph_cache(self.net_g)
                 clear_cuda_graph_cache(self.hubert_model)
                 del (self.net_g, self.n_spk, self.hubert_model, self.tgt_sr)  # ,cpt
+                # The pipeline holds the pitch extractor (RMVPE / FCPE) as well.
+                self.pipeline = None
                 self.hubert_model = self.net_g = self.n_spk = self.hubert_model = (
                     self.tgt_sr
                 ) = None

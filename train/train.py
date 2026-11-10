@@ -202,9 +202,12 @@ def run(rank, n_gpus, hps, logger, use_ddp):
         collate_fn = TextAudioCollateMultiNSFsid()
     else:
         collate_fn = TextAudioCollate()
+    # A few-minute dataset has only a handful of batches; four loader
+    # processes with eight prefetched batches each would mostly sit idle.
+    loader_workers = max(1, min(4, (os.cpu_count() or 4) // 2, len(train_sampler)))
     train_loader = DataLoader(
         train_dataset,
-        num_workers=4,
+        num_workers=loader_workers,
         shuffle=False,
         pin_memory=True,
         collate_fn=collate_fn,

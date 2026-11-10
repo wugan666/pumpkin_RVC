@@ -169,6 +169,19 @@ config = Config()
 vc = VC(config)
 
 
+def fetch_missing_inference_models():
+    """Download HuBERT / RMVPE in the background on a fresh install."""
+    try:
+        for line in download_assets(inference_assets()):
+            if " MB" not in line:
+                print(line, flush=True)
+    except Exception as error:
+        print(error, flush=True)
+
+
+threading.Thread(target=fetch_missing_inference_models, daemon=True).start()
+
+
 i18n = I18nAuto()
 logger.info(i18n)
 print(

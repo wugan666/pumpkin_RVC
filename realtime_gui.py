@@ -10,7 +10,8 @@ os.environ.setdefault("weight_root", "assets/weights")
 os.environ.setdefault("index_root", "logs")
 os.environ.setdefault("outside_index_root", "assets/indices")
 
-os.environ["OMP_NUM_THREADS"] = "4"
+# CPU inference scales with cores; beyond 8 threads the gain is gone.
+os.environ.setdefault("OMP_NUM_THREADS", str(max(1, min(8, os.cpu_count() or 4))))
 
 realtime_config_path = os.path.join(now_dir, "configs", "config.json")
 
@@ -25,6 +26,7 @@ def printt(strr, *args):
 
 
 if __name__ == "__main__":
+    import gc
     import json
     import re
     import time
@@ -744,6 +746,11 @@ if __name__ == "__main__":
                 self.rvc if hasattr(self, "rvc") else None,
                 protect=cfg.protect,
             )
+            # The previous voice model is unreferenced now; give its memory back.
+            self.engine = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             cfg.samplerate = (
                 self.rvc.tgt_sr
                 if cfg.sr_type == "sr_model"
