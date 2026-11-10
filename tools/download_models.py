@@ -84,6 +84,15 @@ def training_assets(version="v2", sr="40k", if_f0=True):
     return assets
 
 
+def windows_assets():
+    """ffmpeg, which the WebUI needs to read audio files (Windows only; on
+    Linux and macOS it comes from the package manager)."""
+    return [
+        Asset("ffmpeg.exe", "ffmpeg.exe", "ffmpeg"),
+        Asset("ffprobe.exe", "ffprobe.exe", "ffmpeg"),
+    ]
+
+
 def missing_assets(assets):
     return [asset for asset in assets if not asset.present()]
 

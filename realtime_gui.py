@@ -118,6 +118,8 @@ if __name__ == "__main__":
         "auto_threshold": True,
         "auto_pitch": True,
         "auto_block": True,
+        "auto_start": True,
+        "started_ok": False,
         "show_advanced": False,
         "pitch": 0,
         "formant": 0.0,
@@ -243,6 +245,7 @@ if __name__ == "__main__":
         def launcher(self):
             data = self.load()
             self.gui_config.hubert_context = float(data["hubert_context"])
+            self.started_ok = bool(data["started_ok"])
             sg.theme("SystemDefaultForReal")
             if sys.platform == "win32":
                 sg.set_options(font=("Microsoft YaHei UI", 10))
@@ -468,6 +471,12 @@ if __name__ == "__main__":
                             key="stop_vc",
                             disabled=True,
                         ),
+                        sg.Checkbox(
+                            i18n("打开软件后自动开始"),
+                            key="auto_start",
+                            default=data["auto_start"],
+                            enable_events=True,
+                        ),
                         sg.Radio(
                             i18n("输入监听"),
                             "function",
@@ -527,6 +536,9 @@ if __name__ == "__main__":
             self.window = sg.Window(
                 i18n("RVC 实时变声"), layout=layout, finalize=True, resizable=True
             )
+            # Once a setup has worked, opening the program is all it takes.
+            if data["auto_start"] and data["started_ok"] and data["pth_path"]:
+                self.window.write_event_value("start_vc", None)
             if IS_WINDOWS and not find_virtual_cable(self.output_devices):
                 self.set_status(
                     i18n("未检测到虚拟声卡：要让队友听到变声，请先安装 VB-CABLE（见 README）"),
@@ -553,6 +565,7 @@ if __name__ == "__main__":
             settings = {key: values[key] for key in DEFAULTS if key in values}
             settings["hubert_context"] = self.gui_config.hubert_context
             settings["show_advanced"] = self.show_advanced
+            settings["started_ok"] = self.started_ok
             # The devices in use can differ from the form after an MME fallback.
             cfg = self.gui_config
             if cfg.sg_hostapi:
@@ -738,6 +751,7 @@ if __name__ == "__main__":
                                 title=i18n("启动失败"),
                             )
                             continue
+                        self.started_ok = True
                         self.save_settings(values)
                         self.reset_run_state()
                         self.set_running(True)
@@ -775,6 +789,8 @@ if __name__ == "__main__":
                     if values["auto_pitch"] and hasattr(self, "rvc"):
                         self.rvc.auto_pitch_locked = False
                         self.rvc.source_f0.clear()
+                elif event == "auto_start":
+                    self.save_settings(values)
                 elif event == "auto_block":
                     pass  # read when the conversion starts
                 elif event == "formant":
