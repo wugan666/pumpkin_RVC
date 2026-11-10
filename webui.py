@@ -1729,7 +1729,7 @@ def clone_preset_choices():
     return [i18n(label) for label in CLONE_PRESETS]
 
 
-def clone_voice(name, files, recording, folder, preset, sr, batch_size):
+def clone_voice(name, files, recording, folder, preset, sr, batch_size, cleanup=True):
     """Upload-to-model in one click: dataset, base models, training, index."""
     keep = {"__type__": "update"}
 
@@ -1756,6 +1756,15 @@ def clone_voice(name, files, recording, folder, preset, sr, batch_size):
         yield emit("失败", traceback.format_exc(), running=False)
         return
     summary = voice_clone.describe_dataset(count, seconds)
+    yield emit("检查素材质量", summary)
+    try:
+        report = voice_clone.quality_report(
+            voice_clone.list_dataset_files(trainset_dir)
+        )
+    except Exception:
+        report = []
+    if report:
+        summary += "\n" + "\n".join(i18n(line) for line in report)
 
     try:
         assets = inference_assets() + training_assets("v2", sr, True)
@@ -1803,12 +1812,21 @@ def clone_voice(name, files, recording, folder, preset, sr, batch_size):
         yield emit("未完成", "%s\n\n%s" % (summary, status), running=False)
         return
     index_path = get_index_path_from_model(model_name)
+    freed = 0
+    if cleanup:
+        try:
+            freed = voice_clone.cleanup_experiment(os.path.join(now_dir, "logs", name))
+        except Exception:
+            logger.exception("Could not clean up %s", name)
     detail = "\n".join(
         (
             summary,
             "",
             "%s：%s" % (i18n("模型"), os.path.join(weight_root, model_name)),
             "%s：%s" % (i18n("索引"), index_path or i18n("未生成")),
+            "%s：%.1f GB" % (i18n("已清理训练中间文件"), freed / 1e9)
+            if freed
+            else "",
             "",
             i18n("现在可以在右侧试听，也可以在“模型推理”或实时变声(realtime_gui)中直接选择该音色。"),
         )
@@ -2038,6 +2056,13 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS + APP_CSS) as app:
                             step=1,
                             label=i18n("每张显卡的batch_size"),
                             value=default_batch_size,
+                            interactive=True,
+                        )
+                        clone_cleanup = gr.Checkbox(
+                            label=i18n(
+                                "完成后清理训练中间文件以节省硬盘（清理后不能继续训练该音色）"
+                            ),
+                            value=True,
                             interactive=True,
                         )
                     clone_button = gr.Button(
@@ -3137,6 +3162,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS + APP_CSS) as app:
             clone_preset,
             clone_sr,
             clone_batch_size,
+            clone_cleanup,
         ],
         [clone_info, clone_button, clone_stop_button, sid0, clone_model],
         api_name="clone_voice",

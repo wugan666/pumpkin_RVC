@@ -124,3 +124,105 @@ def describe_dataset(count, seconds):
     if seconds < RECOMMENDED_SECONDS:
         text += "\n提示：素材不足 1 分钟，音色相似度会比较有限，建议准备 1~10 分钟以上的干净人声"
     return text
+
+
+# ---------------------------------------------------------------- quality
+
+# Seconds analysed per file; enough to judge the recording conditions.
+ANALYSIS_SECONDS = 120
+
+
+def analyze_file(path):
+    """Measure the recording conditions of one file, or None if unreadable."""
+    import librosa
+    import numpy as np
+
+    try:
+        audio, _ = librosa.load(path, sr=16000, mono=True, duration=ANALYSIS_SECONDS)
+    except Exception:
+        return None
+    if audio.size < 1600:
+        return None
+    frames = audio[: audio.size // 320 * 320].reshape(-1, 320)
+    level = 10 * np.log10((frames**2).mean(axis=1) + 1e-10)
+    loud = float(np.percentile(level, 95))
+    return {
+        "clipped": float((np.abs(audio) >= 0.99).mean()),
+        "floor_db": float(np.percentile(level, 5)),
+        "loud_db": loud,
+        # frames more than 40 dB under the loud parts count as silence
+        "silence": float((level < loud - 40).mean()),
+    }
+
+
+def quality_report(paths, max_files=30):
+    """Warnings about the training audio as a list of human readable lines."""
+    step = max(1, len(paths) // max_files)
+    stats = [s for s in (analyze_file(p) for p in paths[::step]) if s]
+    if not stats:
+        return []
+    import numpy as np
+
+    clipped = float(np.mean([s["clipped"] for s in stats]))
+    floor = float(np.median([s["floor_db"] for s in stats]))
+    loud = float(np.median([s["loud_db"] for s in stats]))
+    silence = float(np.mean([s["silence"] for s in stats]))
+    warnings = []
+    if clipped > 0.001:
+        warnings.append(
+            "⚠ 录音有削波失真（%.1f%% 的采样点顶格），建议降低录音音量后重录" % (clipped * 100)
+        )
+    if loud - floor < 30:
+        warnings.append(
+            "⚠ 背景声较大（人声只比背景高 %d dB），可能带有伴奏、混响或噪声，建议先做人声分离"
+            % round(loud - floor)
+        )
+    if loud < -35:
+        warnings.append("⚠ 录音音量很小，建议靠近麦克风或提高录音音量")
+    if silence > 0.6:
+        warnings.append("⚠ 素材中大部分是静音（%d%%），有效人声偏少" % round(silence * 100))
+    if not warnings:
+        warnings.append("✓ 素材质量检查通过（无削波，背景干净）")
+    return warnings
+
+
+def list_dataset_files(trainset_dir):
+    return [
+        os.path.join(trainset_dir, name)
+        for name in sorted(os.listdir(trainset_dir))
+        if os.path.isfile(os.path.join(trainset_dir, name)) and _is_audio(name)
+    ]
+
+
+# ---------------------------------------------------------------- cleanup
+
+# Intermediate training data inside logs/<name>; the index and logs are kept.
+INTERMEDIATE_DIRS = (
+    "0_gt_wavs",
+    "1_16k_wavs",
+    "2a_f0",
+    "2b-f0nsf",
+    "3_feature256",
+    "3_feature768",
+)
+
+
+def cleanup_experiment(exp_dir):
+    """Delete checkpoints and extracted features of a finished clone.
+
+    Returns the number of bytes freed. After this the voice can still be used
+    (model, index) but training cannot be resumed.
+    """
+    freed = 0
+    if not os.path.isdir(exp_dir):
+        return freed
+    for name in os.listdir(exp_dir):
+        path = os.path.join(exp_dir, name)
+        if os.path.isfile(path) and re.match(r"^[GD]_\d+\.pth$", name):
+            freed += os.path.getsize(path)
+            os.remove(path)
+        elif os.path.isdir(path) and name in INTERMEDIATE_DIRS:
+            for root, _, files in os.walk(path):
+                freed += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+            shutil.rmtree(path)
+    return freed
