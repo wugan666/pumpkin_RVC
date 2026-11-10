@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from scipy import signal
 
+from infer.autopitch import MIN_FRAMES, suggest_transpose
 from infer.hubert import extract_hubert_features
 from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 
@@ -67,6 +68,7 @@ class Pipeline(object):
         p_len,
         f0_up_key,
         f0_method,
+        target_f0_median=None,
     ):
         if f0_method not in ("pm", "rmvpe", "fcpe"):
             raise ValueError(f"Unsupported F0 method: {f0_method}")
@@ -125,6 +127,11 @@ class Pipeline(object):
         # Remember which frames the tracker called voiced before the gaps are
         # interpolated away: consonant protection needs the real decision.
         voiced = np.asarray(f0) > 0
+        if target_f0_median and voiced.sum() >= MIN_FRAMES:
+            f0_up_key = suggest_transpose(
+                float(np.median(f0[voiced])), target_f0_median
+            )
+        self.applied_f0_up_key = f0_up_key
         try:
             uv = f0 == 0
             f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
@@ -282,7 +289,12 @@ class Pipeline(object):
         rms_mix_rate,
         version,
         protect,
+        target_f0_median=None,
     ):
+        """``target_f0_median`` (Hz) replaces ``f0_up_key`` by the transposition
+        that moves this audio into the target voice's range; the value used is
+        left in ``self.applied_f0_up_key``."""
+        self.applied_f0_up_key = f0_up_key
         if (
             file_index != ""
             and os.path.exists(file_index)
@@ -326,6 +338,7 @@ class Pipeline(object):
                 p_len,
                 f0_up_key,
                 f0_method,
+                target_f0_median,
             )
             pitch = pitch[:p_len]
             pitchf = pitchf[:p_len]

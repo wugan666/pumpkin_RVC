@@ -1,5 +1,6 @@
 import os
 import traceback
+from collections import deque
 from time import time as ttime
 import faiss
 import numpy as np
@@ -9,6 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchaudio.transforms import Resample
 
+from infer.autopitch import (
+    LOCK_FRAMES,
+    MIN_FRAMES,
+    model_f0_median,
+    suggest_transpose,
+)
 from infer.hubert import extract_hubert_features, load_hubert_model
 from i18n.i18n import I18nAuto
 from tools.cuda_graph import run_cuda_graph
@@ -115,6 +122,13 @@ class RVC:
         self.hubert_context = 1.0
         self.feat_cache = None
         self.feat_cache_key = None
+        # Automatic transposition: voiced source F0 seen so far (Hz, one value
+        # per 10 ms frame) is compared with the model's training-set median.
+        self.auto_pitch = False
+        self.auto_pitch_locked = False
+        self.auto_key = None
+        self.source_f0 = deque(maxlen=LOCK_FRAMES)
+        self.raw_f0 = np.zeros(0, dtype=np.float32)
 
         self.resample_kernel = {}
 
@@ -131,6 +145,7 @@ class RVC:
             cpt["config"][-3] = cpt["weight"]["emb_g.weight"].shape[0]
             self.if_f0 = cpt.get("f0", 1)
             self.version = cpt.get("version", "v1")
+            self.f0_median = model_f0_median(cpt, self.pth_path)
             if self.is_half:
                 self.net_g = self.net_g.half()
             else:
@@ -146,6 +161,7 @@ class RVC:
             self.tgt_sr = last_rvc.tgt_sr
             self.if_f0 = last_rvc.if_f0
             self.version = last_rvc.version
+            self.f0_median = getattr(last_rvc, "f0_median", None)
             self.is_half = last_rvc.is_half
             self.net_g = last_rvc.net_g
 
@@ -182,6 +198,28 @@ class RVC:
         self.last_voiced_f0 = 0.0
         self.infer_count = 0
         self.feat_cache = None
+        self.source_f0.clear()
+        self.auto_pitch_locked = False
+        self.auto_key = None
+
+    def update_auto_pitch(self):
+        """Derive the transposition from the speaker's own pitch.
+
+        The estimate follows the incoming voice for the first few seconds of
+        speech and is then frozen, so the key does not wander mid-sentence.
+        """
+        if (
+            not self.auto_pitch
+            or self.auto_pitch_locked
+            or not self.f0_median
+            or len(self.source_f0) < MIN_FRAMES
+        ):
+            return
+        self.auto_key = suggest_transpose(
+            float(np.median(self.source_f0)), self.f0_median
+        )
+        self.f0_up_key = self.auto_key
+        self.auto_pitch_locked = len(self.source_f0) >= LOCK_FRAMES
 
     def change_key(self, new_key):
         self.f0_up_key = new_key
@@ -207,6 +245,7 @@ class RVC:
         voiced pitch keeps the input in-distribution.
         """
         f0 = np.array(f0, dtype=np.float32).reshape(-1)
+        self.raw_f0 = f0.copy()
         voiced = f0 > 0
         if voiced.any():
             voiced_idx = np.where(voiced)[0]
@@ -381,12 +420,17 @@ class RVC:
             f0_extractor_frame = block_frame_16k + 800
             if f0method == "rmvpe":
                 f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
+            self.update_auto_pitch()
             pitch, pitchf, voiced = self.get_f0(
                 input_wav[-f0_extractor_frame:],
                 self.f0_up_key - self.formant_shift,
                 f0method,
             )
             shift = block_frame_16k // 160
+            # Only this block's frames are new; the rest of the window was
+            # already counted by earlier calls.
+            fresh = self.raw_f0[3:-1][-shift:]
+            self.source_f0.extend(fresh[fresh > 0].tolist())
             self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
             self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
             self.cache_voiced[:-shift] = self.cache_voiced[shift:].clone()

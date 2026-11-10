@@ -7,6 +7,7 @@ from collections import OrderedDict
 import torch
 
 from i18n.i18n import I18nAuto
+from infer.autopitch import dataset_f0_median
 from tools.file_io import read_text
 
 i18n = I18nAuto()
@@ -63,6 +64,11 @@ def savee(ckpt, sr, if_f0, name, epoch, version, hps):
         speaker_info = normalize_speaker_info(getattr(hps, "speaker_info", []))
         if speaker_info:
             opt["speaker_info"] = speaker_info
+        elif if_f0:
+            # Lets inference transpose automatically into this voice's range.
+            f0_median = dataset_f0_median(getattr(hps, "model_dir", ""))
+            if f0_median:
+                opt["f0_median"] = f0_median
         torch.save(opt, "assets/weights/%s.pth" % name)
         return i18n("成功")
     except:
@@ -213,6 +219,10 @@ def extract_small_model(path, name, sr, if_f0, info, version):
         opt["f0"] = int(if_f0)
         if speaker_info:
             opt["speaker_info"] = speaker_info
+        elif int(if_f0):
+            f0_median = dataset_f0_median(os.path.dirname(os.path.abspath(path)))
+            if f0_median:
+                opt["f0_median"] = f0_median
         torch.save(opt, "assets/weights/%s.pth" % name)
         return i18n("成功")
     except:

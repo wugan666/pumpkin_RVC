@@ -1826,7 +1826,7 @@ def stop_clone():
     return stop_train_task("一键训练")
 
 
-def clone_try(model_name, upload, recording, pitch):
+def clone_try(model_name, upload, recording, pitch, auto_pitch=True):
     """Convert a short clip with the chosen voice using sensible defaults."""
     keep = {"__type__": "update"}
     audio = recording or upload
@@ -1847,6 +1847,7 @@ def clone_try(model_name, upload, recording, pitch):
             0,
             0.25,
             0.33,
+            bool(auto_pitch),
         )
     except Exception:
         return format_status("试听", "失败", traceback.format_exc()), None, keep
@@ -2088,14 +2089,20 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS + APP_CSS) as app:
                                 source="microphone",
                                 type="filepath",
                             )
-                        clone_try_pitch = gr.Slider(
-                            minimum=-12,
-                            maximum=12,
-                            step=1,
-                            value=0,
-                            label=i18n("变调（男转女 +12，女转男 -12）"),
+                        clone_try_auto_pitch = gr.Checkbox(
+                            label=i18n("自动变调（推荐，自动把你的音高对到该音色）"),
+                            value=True,
                             interactive=True,
                         )
+                        with gr.Accordion(i18n("手动变调"), open=False):
+                            clone_try_pitch = gr.Slider(
+                                minimum=-12,
+                                maximum=12,
+                                step=1,
+                                value=0,
+                                label=i18n("变调（男转女 +12，女转男 -12）"),
+                                interactive=True,
+                            )
                         clone_try_button = gr.Button(i18n("试听转换"), variant="primary")
                         clone_try_output = gr.Audio(label=i18n("试听结果"))
                         clone_try_info = gr.Textbox(
@@ -2158,6 +2165,13 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS + APP_CSS) as app:
                                     value="rmvpe",
                                     interactive=True,
                                 )
+                        auto_pitch0 = gr.Checkbox(
+                            label=i18n(
+                                "自动变调（按音色自动匹配音高，适合说话；唱歌请关闭并手动按八度调）"
+                            ),
+                            value=False,
+                            interactive=True,
+                        )
                         but0 = gr.Button(
                             i18n("转换"), variant="primary", elem_id="rvc-main-convert"
                         )
@@ -2232,6 +2246,7 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS + APP_CSS) as app:
                         resample_sr0,
                         rms_mix_rate0,
                         protect0,
+                        auto_pitch0,
                     ],
                     [vc_output1, vc_output2],
                     api_name="infer_convert",
@@ -3134,7 +3149,13 @@ with gr.Blocks(title="RVC WebUI", css=TRAINING_INFO_CSS + APP_CSS) as app:
     )
     clone_try_button.click(
         clone_try,
-        [clone_model, clone_try_upload, clone_try_recording, clone_try_pitch],
+        [
+            clone_model,
+            clone_try_upload,
+            clone_try_recording,
+            clone_try_pitch,
+            clone_try_auto_pitch,
+        ],
         [clone_try_info, clone_try_output, sid0],
         api_name="clone_try",
     )

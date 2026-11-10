@@ -15,6 +15,7 @@ from infer.module.models import (
     SynthesizerTrnMs768NSFsid,
     SynthesizerTrnMs768NSFsid_nono,
 )
+from infer.autopitch import model_f0_median
 from infer.vc.pipeline import Pipeline
 from infer.vc.utils import *
 from i18n.i18n import I18nAuto
@@ -94,6 +95,7 @@ class VC:
         self.version = None
         self.if_f0 = None
         self.version = None
+        self.f0_median = None
         self.hubert_model = None
 
         self.config = config
@@ -176,6 +178,7 @@ class VC:
         self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]  # n_spk
         self.if_f0 = self.cpt.get("f0", 1)
         self.version = self.cpt.get("version", "v1")
+        self.f0_median = model_f0_median(self.cpt, sid)
 
         synthesizer_class = {
             ("v1", 1): SynthesizerTrnMs256NSFsid,
@@ -234,6 +237,7 @@ class VC:
         resample_sr,
         rms_mix_rate,
         protect,
+        auto_pitch=False,
     ):
         if input_audio_path is None:
             return inference_status("单次推理", "等待输入", i18n("请上传音频文件")), None
@@ -276,6 +280,7 @@ class VC:
                 rms_mix_rate,
                 self.version,
                 protect,
+                self.f0_median if auto_pitch and self.if_f0 == 1 else None,
             )
             if self.tgt_sr != resample_sr >= 16000:
                 tgt_sr = resample_sr
@@ -286,6 +291,13 @@ class VC:
                 if os.path.exists(file_index)
                 else "%s：%s" % (i18n("索引"), i18n("未使用"))
             )
+            if auto_pitch and self.if_f0 == 1:
+                index_info += "\n%s：%s" % (
+                    i18n("自动变调"),
+                    "%+d" % self.pipeline.applied_f0_up_key
+                    if self.f0_median
+                    else i18n("该模型没有音高统计，已使用手动变调"),
+                )
             return (
                 inference_status(
                     "单次推理",

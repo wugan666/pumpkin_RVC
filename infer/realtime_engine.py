@@ -52,6 +52,8 @@ class RealtimeSettings:
         self.index_rate = 0.0
         self.protect = 0.33
         self.f0method = "rmvpe"  # (live)
+        # (live) pick the transposition from the speaker's and the model's pitch
+        self.auto_pitch = False
         self.function = "vc"  # (live) "vc" converts, "im" monitors the input
 
 
@@ -148,6 +150,7 @@ class RealtimeEngine:
             "output_db": -120.0,
             "gate_open": True,
             "sola_offset": 0,
+            "auto_key": None,  # transposition chosen by auto pitch, if any
         }
 
     def _frames(self, seconds):
@@ -344,7 +347,9 @@ class RealtimeEngine:
         source = source[self.extra_frame :]
         # infer
         if converting:
+            self.rvc.auto_pitch = bool(cfg.auto_pitch)
             infer_wav = self._convert()
+            self.stats["auto_key"] = self.rvc.auto_key if cfg.auto_pitch else None
         else:
             infer_wav = source.clone()
         # output noise reduction
@@ -433,6 +438,11 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--pitch", type=float, default=0)
+    parser.add_argument(
+        "--auto-pitch",
+        action="store_true",
+        help="transpose automatically (needs a model with pitch statistics)",
+    )
     parser.add_argument("--formant", type=float, default=0.0)
     parser.add_argument("--index-rate", type=float, default=0.0)
     parser.add_argument("--protect", type=float, default=0.33)
@@ -463,6 +473,7 @@ def main():
     config = Config()
     cfg = RealtimeSettings()
     cfg.pitch = args.pitch
+    cfg.auto_pitch = args.auto_pitch
     cfg.formant = args.formant
     cfg.index_rate = args.index_rate if args.index else 0.0
     cfg.protect = args.protect
@@ -494,6 +505,8 @@ def main():
     times = []
     out = simulate_file(engine, audio.astype(np.float32), times)
     sf.write(args.output, out, engine.samplerate)
+    if args.auto_pitch:
+        print("auto pitch: %s (model median F0: %s)" % (rvc.auto_key, rvc.f0_median))
     block_ms = 1000 * engine.block_frame / engine.samplerate
     print(
         "blocks=%d block=%.0fms infer mean=%.0fms max=%.0fms overruns=%d delay=%.0fms"
