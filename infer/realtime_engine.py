@@ -66,7 +66,9 @@ def soft_limit(x, knee=LIMITER_KNEE):
 
 
 class RealtimeEngine:
-    def __init__(self, rvc, settings, device, samplerate):
+    def __init__(self, rvc, settings, device, samplerate, block_frame=None):
+        """``block_frame`` fixes the block size in samples for hosts that
+        dictate it (the VST plugin); otherwise it follows ``block_time``."""
         self.rvc = rvc
         self.cfg = settings
         rvc.hubert_context = settings.hubert_context
@@ -78,6 +80,8 @@ class RealtimeEngine:
         # Blocks are a whole number of 20 ms HuBERT frames so that features
         # computed for earlier blocks stay aligned and can be reused.
         self.block_frame = max(1, round(cfg.block_time * 50)) * 2 * self.zc
+        if block_frame is not None:
+            self.block_frame = int(block_frame)
         self.block_frame_16k = 160 * self.block_frame // self.zc
         self.crossfade_frame = self._frames(cfg.crossfade_time)
         self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)

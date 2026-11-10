@@ -83,6 +83,14 @@ class WinEvent:
 
 
 class RVCStreamEngine:
+    """Thin adapter between the plugin's protocol and RVC's realtime engine.
+
+    All signal processing lives in infer/realtime_engine.py, shared with the
+    standalone realtime GUI, so both behave identically.
+    """
+
+    F0_METHODS = ("rmvpe", "fcpe", "pm")
+
     def __init__(self, cfg: dict):
         self.root = Path(cfg["rvc_root"]).resolve()
         os.chdir(self.root)
@@ -90,37 +98,22 @@ class RVCStreamEngine:
         os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
         os.environ.setdefault("OMP_NUM_THREADS", "4")
 
-        import librosa
-        import numpy as np
         import torch
-        import torch.nn.functional as F
-        import torchaudio.transforms as tat
 
         from configs.config import Config
         from infer import rtrvc
-        from tools.cuda_graph import run_cuda_graph
+        from infer.realtime_engine import RealtimeEngine, RealtimeSettings
 
-        self.librosa = librosa
-        self.np = np
         self.torch = torch
-        self.F = F
-        self.tat = tat
-        self.run_cuda_graph = run_cuda_graph
-
         self.sample_rate = int(cfg["sample_rate"])
-        self.block_ms = float(cfg["block_ms"])
-        self.crossfade_ms = float(cfg["crossfade_ms"])
-        self.extra_ms = float(cfg["extra_ms"])
-        self.zc = max(1, self.sample_rate // 100)
-        self.block_frame = int(round(self.block_ms / 1000 * self.sample_rate / self.zc) * self.zc)
-        self.block_frame_16k = 160 * self.block_frame // self.zc
-        self.crossfade_frame = int(round(self.crossfade_ms / 1000 * self.sample_rate / self.zc) * self.zc)
-        # Match the source realtime GUI: SOLA overlap is capped at 40 ms and
-        # remains independent of the audio callback block length.
-        self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
-        self.effective_crossfade_ms = 1000.0 * self.sola_buffer_frame / self.sample_rate
-        self.sola_search_frame = self.zc
-        self.extra_frame = int(round(self.extra_ms / 1000 * self.sample_rate / self.zc) * self.zc)
+        zc = max(1, self.sample_rate // 100)
+        # The plugin sends blocks of exactly this many frames.
+        self.block_frame = int(round(float(cfg["block_ms"]) / 1000 * self.sample_rate / zc) * zc)
+
+        self.settings = RealtimeSettings()
+        self.settings.block_time = float(cfg["block_ms"]) / 1000
+        self.settings.crossfade_time = float(cfg["crossfade_ms"]) / 1000
+        self.settings.extra_time = float(cfg["extra_ms"]) / 1000
 
         self.config = Config()
         self.rvc = rtrvc.RVC(
@@ -132,48 +125,25 @@ class RVCStreamEngine:
             self.config,
             None,
         )
-
-        total_frames = self.extra_frame + self.crossfade_frame + self.sola_search_frame + self.block_frame
-        self.input_wav = torch.zeros(total_frames, device=self.config.device, dtype=torch.float32)
-        self.input_wav_res = torch.zeros(160 * total_frames // self.zc, device=self.config.device, dtype=torch.float32)
-        self.rms_buffer = np.zeros(4 * self.zc, dtype="float32")
-        self.sola_buffer = torch.zeros(self.sola_buffer_frame, device=self.config.device, dtype=torch.float32)
-        self.sola_den_kernel = torch.ones(1, 1, self.sola_buffer_frame, device=self.config.device, dtype=torch.float32)
-        self.skip_head = self.extra_frame // self.zc
-        self.return_length = (self.block_frame + self.sola_buffer_frame + self.sola_search_frame) // self.zc
-        self.fade_in_window = torch.sin(
-            0.5 * np.pi * torch.linspace(0.0, 1.0, steps=self.sola_buffer_frame, device=self.config.device)
-        ) ** 2
-        self.fade_out_window = 1 - self.fade_in_window
-        self.resampler = tat.Resample(orig_freq=self.sample_rate, new_freq=16000, dtype=torch.float32).to(self.config.device)
-        self.resampler2 = None
-        if self.rvc.tgt_sr != self.sample_rate:
-            self.resampler2 = tat.Resample(orig_freq=self.rvc.tgt_sr, new_freq=self.sample_rate, dtype=torch.float32).to(self.config.device)
+        self.engine = RealtimeEngine(
+            self.rvc,
+            self.settings,
+            self.config.device,
+            self.sample_rate,
+            block_frame=self.block_frame,
+        )
+        self.effective_crossfade_ms = 1000.0 * self.engine.sola_buffer_frame / self.sample_rate
         self.last_pitch = None
         self.last_formant = None
         self.last_index_rate = None
 
     def prewarm(self) -> None:
-        phase = self.torch.arange(self.block_frame, device=self.config.device, dtype=self.torch.float32)
-        probe = 0.05 * self.torch.sin(2 * self.np.pi * 220.0 * phase / self.sample_rate)
-        self.process(probe.cpu().numpy(), 12.0, 0.0, 0.0, 0.5, -60.0, 0)
+        self.engine.prewarm()
         if self.torch.device(self.config.device).type == "cuda":
             self.torch.cuda.synchronize(self.config.device)
 
-        self.input_wav.zero_()
-        self.input_wav_res.zero_()
-        self.rms_buffer.fill(0.0)
-        self.sola_buffer.zero_()
-        if hasattr(self.rvc, "cache_pitch"):
-            self.rvc.cache_pitch.zero_()
-        if hasattr(self.rvc, "cache_pitchf"):
-            self.rvc.cache_pitchf.zero_()
-
     def process(self, audio, pitch: float, formant: float, index_rate: float,
                 rms_mix: float, threshold: float, f0_method: int):
-        np = self.np
-        torch = self.torch
-        F = self.F
         if len(audio) != self.block_frame:
             raise ValueError(f"block mismatch: worker={self.block_frame}, request={len(audio)}")
 
@@ -186,71 +156,10 @@ class RVCStreamEngine:
         if self.last_index_rate != index_rate:
             self.rvc.change_index_rate(index_rate)
             self.last_index_rate = index_rate
-
-        indata = np.asarray(audio, dtype=np.float32).copy()
-        if threshold > -60.0:
-            gated = np.append(self.rms_buffer, indata)
-            rms = self.librosa.feature.rms(y=gated, frame_length=4 * self.zc, hop_length=self.zc)[:, 2:]
-            self.rms_buffer[:] = gated[-4 * self.zc :]
-            gated = gated[2 * self.zc - self.zc // 2 :]
-            below = self.librosa.amplitude_to_db(rms, ref=1.0)[0] < threshold
-            for i, mute in enumerate(below):
-                if mute:
-                    gated[i * self.zc : (i + 1) * self.zc] = 0
-            indata = gated[self.zc // 2 :]
-
-        self.input_wav[:-self.block_frame] = self.input_wav[self.block_frame:].clone()
-        self.input_wav[-self.block_frame:] = torch.from_numpy(indata).to(self.config.device)
-        self.input_wav_res[:-self.block_frame_16k] = self.input_wav_res[self.block_frame_16k:].clone()
-        resample_input = self.input_wav[-self.block_frame - 2 * self.zc :]
-        resampled = self.run_cuda_graph(
-            self.resampler,
-            "vst-input-resample",
-            lambda value: self.resampler(value),
-            resample_input,
-        )[160:]
-        self.input_wav_res[-self.block_frame_16k:] = resampled[-self.block_frame_16k:]
-
-        method = ("rmvpe", "fcpe", "pm")[max(0, min(2, int(f0_method)))]
-        infer_wav = self.rvc.infer(
-            self.input_wav_res,
-            self.block_frame_16k,
-            self.skip_head,
-            self.return_length,
-            method,
-        )
-        if self.resampler2 is not None:
-            infer_wav = self.run_cuda_graph(
-                self.resampler2,
-                "vst-output-resample",
-                lambda value: self.resampler2(value),
-                infer_wav,
-            )
-
-        if rms_mix < 1.0:
-            input_tail = self.input_wav[self.extra_frame :]
-            rms1 = self.librosa.feature.rms(
-                y=input_tail[: infer_wav.shape[0]].cpu().numpy(), frame_length=4 * self.zc, hop_length=self.zc
-            )
-            rms1 = torch.from_numpy(rms1).to(self.config.device)
-            rms1 = F.interpolate(rms1.unsqueeze(0), size=infer_wav.shape[0] + 1, mode="linear", align_corners=True)[0, 0, :-1]
-            rms2 = self.librosa.feature.rms(
-                y=infer_wav.cpu().numpy(), frame_length=4 * self.zc, hop_length=self.zc
-            )
-            rms2 = torch.from_numpy(rms2).to(self.config.device)
-            rms2 = F.interpolate(rms2.unsqueeze(0), size=infer_wav.shape[0] + 1, mode="linear", align_corners=True)[0, 0, :-1]
-            rms2 = torch.maximum(rms2, torch.full_like(rms2, 1e-3))
-            infer_wav *= torch.pow(rms1 / rms2, 1.0 - rms_mix)
-
-        conv_input = infer_wav[None, None, : self.sola_buffer_frame + self.sola_search_frame]
-        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
-        cor_den = torch.sqrt(F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8)
-        sola_offset = int(torch.argmax(cor_nom[0, 0] / cor_den[0, 0]))
-        infer_wav = infer_wav[sola_offset:]
-        infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
-        infer_wav[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
-        self.sola_buffer[:] = infer_wav[self.block_frame : self.block_frame + self.sola_buffer_frame]
-        return infer_wav[: self.block_frame].float().cpu().numpy()
+        self.settings.rms_mix_rate = float(rms_mix)
+        self.settings.threhold = float(threshold)
+        self.settings.f0method = self.F0_METHODS[max(0, min(2, int(f0_method)))]
+        return self.engine.process(audio)
 
 
 def run(args: argparse.Namespace) -> int:
