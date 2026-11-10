@@ -122,6 +122,9 @@ class Pipeline(object):
                 threshold=0.006,
             ).squeeze().detach().cpu().numpy()
 
+        # Remember which frames the tracker called voiced before the gaps are
+        # interpolated away: consonant protection needs the real decision.
+        voiced = np.asarray(f0) > 0
         try:
             uv = f0 == 0
             f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
@@ -136,7 +139,7 @@ class Pipeline(object):
         f0_mel[f0_mel <= 1] = 1
         f0_mel[f0_mel > 255] = 255
         f0_coarse = np.rint(f0_mel).astype(np.int32)
-        return f0_coarse, f0bak  # 1-0
+        return f0_coarse, f0bak, voiced
 
     def vc(
         self,
@@ -152,6 +155,7 @@ class Pipeline(object):
         index_rate,
         version,
         protect,
+        voiced=None,
     ):
         feats = torch.from_numpy(audio0)
         if self.is_half:
@@ -172,7 +176,15 @@ class Pipeline(object):
                 version,
                 padding_mask=padding_mask,
             )
-        if protect < 0.5 and pitch is not None and pitchf is not None:
+        # Protection only matters where retrieval replaced the features.
+        use_protect = (
+            protect < 0.5
+            and voiced is not None
+            and index is not None
+            and index_vectors is not None
+            and index_rate != 0
+        )
+        if use_protect:
             feats0 = feats.clone()
         if (
             not isinstance(index, type(None))
@@ -196,7 +208,7 @@ class Pipeline(object):
             )
 
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
-        if protect < 0.5 and pitch is not None and pitchf is not None:
+        if use_protect:
             feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
                 0, 2, 1
             )
@@ -208,13 +220,14 @@ class Pipeline(object):
                 pitch = pitch[:, :p_len]
                 pitchf = pitchf[:, :p_len]
 
-        if protect < 0.5 and pitch is not None and pitchf is not None:
-            pitchff = pitchf.clone()
-            pitchff[pitchf > 0] = 1
-            pitchff[pitchf < 1] = protect
-            pitchff = pitchff.unsqueeze(-1)
-            feats = feats * pitchff + feats0 * (1 - pitchff)
-            feats = feats.to(feats0.dtype)
+        if use_protect:
+            # Voiceless consonants and breaths keep more of the source features.
+            # (The interpolated F0 is never 0, so it cannot be used for this.)
+            frames = min(p_len, voiced.shape[1], feats.shape[1])
+            keep = torch.ones(1, feats.shape[1], 1, device=feats.device)
+            keep[0, :frames, 0] = torch.where(voiced[0, :frames], 1.0, float(protect))
+            keep = keep.to(feats0.dtype)
+            feats = feats * keep + feats0 * (1 - keep)
         p_len = torch.tensor([p_len], device=self.device).long()
         with torch.no_grad():
             hasp = pitch is not None and pitchf is not None
@@ -306,9 +319,9 @@ class Pipeline(object):
         audio_pad = np.pad(audio, (self.t_pad, self.t_pad), mode="reflect")
         p_len = audio_pad.shape[0] // self.window
         sid = torch.tensor(sid, device=self.device).unsqueeze(0).long()
-        pitch, pitchf = None, None
+        pitch, pitchf, voiced = None, None, None
         if if_f0 == 1:
-            pitch, pitchf = self.get_f0(
+            pitch, pitchf, voiced = self.get_f0(
                 audio_pad,
                 p_len,
                 f0_up_key,
@@ -319,79 +332,41 @@ class Pipeline(object):
             pitchf = pitchf.astype(np.float32)
             pitch = torch.tensor(pitch, device=self.device).unsqueeze(0).long()
             pitchf = torch.tensor(pitchf, device=self.device).unsqueeze(0).float()
+            voiced = torch.tensor(voiced[:p_len], device=self.device).unsqueeze(0)
         t2 = ttime()
         times[1] += t2 - t1
+
+        def convert(segment, first_frame, last_frame):
+            frames = slice(first_frame, last_frame)
+            return self.vc(
+                model,
+                net_g,
+                sid,
+                segment,
+                pitch[:, frames] if pitch is not None else None,
+                pitchf[:, frames] if pitchf is not None else None,
+                times,
+                index,
+                index_vectors,
+                index_rate,
+                version,
+                protect,
+                voiced[:, frames] if voiced is not None else None,
+            )[self.t_pad_tgt : -self.t_pad_tgt]
+
         for t in opt_ts:
             t = t // self.window * self.window
-            if if_f0 == 1:
-                audio_opt.append(
-                    self.vc(
-                        model,
-                        net_g,
-                        sid,
-                        audio_pad[s : t + self.t_pad2 + self.window],
-                        pitch[:, s // self.window : (t + self.t_pad2) // self.window],
-                        pitchf[:, s // self.window : (t + self.t_pad2) // self.window],
-                        times,
-                        index,
-                        index_vectors,
-                        index_rate,
-                        version,
-                        protect,
-                    )[self.t_pad_tgt : -self.t_pad_tgt]
+            audio_opt.append(
+                convert(
+                    audio_pad[s : t + self.t_pad2 + self.window],
+                    s // self.window,
+                    (t + self.t_pad2) // self.window,
                 )
-            else:
-                audio_opt.append(
-                    self.vc(
-                        model,
-                        net_g,
-                        sid,
-                        audio_pad[s : t + self.t_pad2 + self.window],
-                        None,
-                        None,
-                        times,
-                        index,
-                        index_vectors,
-                        index_rate,
-                        version,
-                        protect,
-                    )[self.t_pad_tgt : -self.t_pad_tgt]
-                )
+            )
             s = t
-        if if_f0 == 1:
-            audio_opt.append(
-                self.vc(
-                    model,
-                    net_g,
-                    sid,
-                    audio_pad[t:],
-                    pitch[:, t // self.window :] if t is not None else pitch,
-                    pitchf[:, t // self.window :] if t is not None else pitchf,
-                    times,
-                    index,
-                    index_vectors,
-                    index_rate,
-                    version,
-                    protect,
-                )[self.t_pad_tgt : -self.t_pad_tgt]
-            )
-        else:
-            audio_opt.append(
-                self.vc(
-                    model,
-                    net_g,
-                    sid,
-                    audio_pad[t:],
-                    None,
-                    None,
-                    times,
-                    index,
-                    index_vectors,
-                    index_rate,
-                    version,
-                    protect,
-                )[self.t_pad_tgt : -self.t_pad_tgt]
-            )
+        audio_opt.append(
+            convert(audio_pad[t:], t // self.window if t is not None else None, None)
+        )
         audio_opt = np.concatenate(audio_opt)
         if rms_mix_rate != 1:
             audio_opt = change_rms(audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
@@ -404,7 +379,7 @@ class Pipeline(object):
         if audio_max > 1:
             max_int16 /= audio_max
         audio_opt = (audio_opt * max_int16).astype(np.int16)
-        del pitch, pitchf, sid
+        del pitch, pitchf, voiced, sid
         if torch.cuda.is_available() and not cuda_graph_enabled(self.device):
             torch.cuda.empty_cache()
         return audio_opt
