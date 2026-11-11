@@ -87,6 +87,8 @@ class RealtimeEngine:
         """``block_frame`` fixes the block size in samples for hosts that
         dictate it (the VST plugin); otherwise it follows ``block_time``."""
         self.rvc = rvc
+        # Built-in effect voices work on the sound card signal directly.
+        self.fullband = bool(getattr(rvc, "fullband", False))
         self.cfg = settings
         rvc.hubert_context = settings.hubert_context
         self.device = device
@@ -146,7 +148,7 @@ class RealtimeEngine:
         self.resampler = tat.Resample(
             orig_freq=self.samplerate, new_freq=16000, dtype=torch.float32
         ).to(device)
-        if rvc.tgt_sr != self.samplerate:
+        if not self.fullband and rvc.tgt_sr != self.samplerate:
             self.resampler2 = tat.Resample(
                 orig_freq=rvc.tgt_sr, new_freq=self.samplerate, dtype=torch.float32
             ).to(device)
@@ -365,6 +367,13 @@ class RealtimeEngine:
         )[0, 0, :-1]
 
     def _convert(self):
+        if self.fullband:
+            source = (
+                self.input_wav_denoise if self.cfg.I_noise_reduce else self.input_wav
+            )
+            return self.rvc.infer_fullband(
+                source, self.samplerate, self.extra_frame, self.return_length * self.zc
+            )
         infer_wav = self.rvc.infer(
             self.input_wav_res,
             self.block_frame_16k,
@@ -580,7 +589,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run a wav file through the realtime engine (offline test)."
     )
-    parser.add_argument("--model", required=True, help=".pth voice model")
+    parser.add_argument(
+        "--model", required=True, help='.pth voice model, or "helium" (built in)'
+    )
     parser.add_argument("--index", default="", help="optional .index file")
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
@@ -640,15 +651,20 @@ def main():
     cfg.I_noise_reduce = args.input_denoise
     cfg.O_noise_reduce = args.output_denoise
 
-    rvc = RVC(
-        cfg.pitch,
-        cfg.formant,
-        args.model,
-        args.index,
-        cfg.index_rate,
-        config,
-        protect=cfg.protect,
-    )
+    if args.model == "helium":
+        from infer.effect_voice import HeliumVoice
+
+        rvc = HeliumVoice(cfg.formant)
+    else:
+        rvc = RVC(
+            cfg.pitch,
+            cfg.formant,
+            args.model,
+            args.index,
+            cfg.index_rate,
+            config,
+            protect=cfg.protect,
+        )
     if args.hubert_context is not None:
         cfg.hubert_context = args.hubert_context
     if args.auto_block:

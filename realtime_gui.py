@@ -41,6 +41,7 @@ if __name__ == "__main__":
 
     from configs.config import Config
     from infer import rtrvc as rvc_for_realtime
+    from infer.effect_voice import HeliumVoice
     from infer.realtime_engine import (
         RealtimeEngine,
         RealtimeSettings,
@@ -141,15 +142,23 @@ if __name__ == "__main__":
     COLOR_BAD = "#c62828"
     COLOR_IDLE = "#57606a"
 
+    # A voice that needs no model file, so a fresh install can be used at once.
+    BUILTIN_HELIUM = i18n("氦气音（内置）")
+
     def list_models():
+        """Trained voices first, then the built-in one."""
         root = os.environ["weight_root"]
-        if not os.path.isdir(root):
-            return []
-        return sorted(
-            os.path.join(root, name).replace("\\", "/")
-            for name in os.listdir(root)
-            if name.endswith(".pth")
-        )
+        models = []
+        if os.path.isdir(root):
+            models = sorted(
+                os.path.join(root, name).replace("\\", "/")
+                for name in os.listdir(root)
+                if name.endswith(".pth")
+            )
+        return models + [BUILTIN_HELIUM]
+
+    def is_voice(path):
+        return path == BUILTIN_HELIUM or os.path.isfile(str(path))
 
     class GUIConfig(RealtimeSettings):
         def __init__(self):
@@ -237,8 +246,8 @@ if __name__ == "__main__":
             # A remembered model that has since been moved or deleted would only
             # produce an error on start; fall back to what is actually there.
             models = list_models()
-            if not os.path.isfile(str(data["pth_path"])):
-                data["pth_path"] = models[0] if models else ""
+            if not is_voice(data["pth_path"]):
+                data["pth_path"] = models[0]
                 data["index_path"] = ""
             if not os.path.isfile(str(data["index_path"])):
                 data["index_path"] = get_index_path_from_model(data["pth_path"])
@@ -890,7 +899,7 @@ if __name__ == "__main__":
             if len(pth_path) == 0:
                 sg.popup(i18n("请选择pth文件"))
                 return False
-            if not os.path.isfile(pth_path):
+            if not is_voice(pth_path):
                 sg.popup(i18n("pth文件不存在：%s") % pth_path)
                 return False
             if index_path and not os.path.isfile(index_path):
@@ -948,17 +957,21 @@ if __name__ == "__main__":
         def start_vc(self):
             torch.cuda.empty_cache()
             cfg = self.gui_config
-            self.ensure_base_models()
-            self.rvc = rvc_for_realtime.RVC(
-                cfg.pitch,
-                cfg.formant,
-                cfg.pth_path,
-                cfg.index_path,
-                cfg.index_rate,
-                self.config,
-                self.rvc if hasattr(self, "rvc") else None,
-                protect=cfg.protect,
-            )
+            if cfg.pth_path == BUILTIN_HELIUM:
+                self.rvc = HeliumVoice(cfg.formant)
+            else:
+                self.ensure_base_models()
+                last = getattr(self, "rvc", None)
+                self.rvc = rvc_for_realtime.RVC(
+                    cfg.pitch,
+                    cfg.formant,
+                    cfg.pth_path,
+                    cfg.index_path,
+                    cfg.index_rate,
+                    self.config,
+                    last if isinstance(last, rvc_for_realtime.RVC) else None,
+                    protect=cfg.protect,
+                )
             # The previous voice model is unreferenced now; give its memory back.
             self.engine = None
             gc.collect()
@@ -986,8 +999,11 @@ if __name__ == "__main__":
                 else self.get_device_samplerate()
             )
             cfg.channels = self.get_device_channels()
-            if cfg.auto_pitch and not self.rvc.f0_median:
-                self.auto_pitch_unavailable = True
+            self.auto_pitch_unavailable = bool(
+                cfg.auto_pitch
+                and not self.rvc.f0_median
+                and not getattr(self.rvc, "fullband", False)
+            )
             printt(i18n("正在预热模型"))
             if self.auto_block:
                 self.set_status(i18n("正在测试本机速度…"), COLOR_WARN)
