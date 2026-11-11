@@ -53,6 +53,7 @@ if __name__ == "__main__":
         match_device,
         preferred_hostapi,
     )
+    from tools import virtual_cable
     from tools.download_models import download_assets, inference_assets
 
     IS_WINDOWS = sys.platform == "win32"
@@ -120,6 +121,7 @@ if __name__ == "__main__":
         "auto_block": True,
         "auto_start": True,
         "started_ok": False,
+        "cable_asked": False,
         "show_advanced": False,
         "pitch": 0,
         "formant": 0.0,
@@ -306,6 +308,12 @@ if __name__ == "__main__":
                             enable_events=True,
                             size=(52, 1),
                             expand_x=True,
+                        ),
+                        sg.Button(
+                            i18n("安装虚拟声卡"),
+                            key="install_cable",
+                            visible=IS_WINDOWS
+                            and not find_virtual_cable(self.output_devices),
                         ),
                     ],
                     [
@@ -537,14 +545,70 @@ if __name__ == "__main__":
                 i18n("RVC 实时变声"), layout=layout, finalize=True, resizable=True
             )
             # Once a setup has worked, opening the program is all it takes.
+            self.cable_asked = bool(data["cable_asked"])
+            if IS_WINDOWS and not find_virtual_cable(self.output_devices):
+                self.offer_virtual_cable()
             if data["auto_start"] and data["started_ok"] and data["pth_path"]:
                 self.window.write_event_value("start_vc", None)
-            if IS_WINDOWS and not find_virtual_cable(self.output_devices):
-                self.set_status(
-                    i18n("未检测到虚拟声卡：要让队友听到变声，请先安装 VB-CABLE（见 README）"),
-                    COLOR_WARN,
-                )
             self.event_handler()
+
+        def offer_virtual_cable(self):
+            """Without a virtual sound card nobody else can hear the converted
+            voice, so offer to install one (asked once; the button stays)."""
+            missing = i18n("未检测到虚拟声卡：点“安装虚拟声卡”后队友才能听到变声")
+            if self.cable_asked:
+                self.set_status(missing, COLOR_WARN)
+                return
+            self.cable_asked = True
+            answer = sg.popup_yes_no(
+                i18n(
+                    "没有检测到虚拟声卡（VB-CABLE）。\n"
+                    "游戏和语音软件要通过它才能收到变声后的声音。\n\n"
+                    "现在自动下载并安装吗？（免费，约 1MB，安装时请在弹出的窗口里点“是”和“安装”）"
+                ),
+                title=i18n("安装虚拟声卡"),
+            )
+            if answer == "Yes":
+                self.install_virtual_cable()
+            else:
+                self.set_status(missing, COLOR_WARN)
+
+        def install_virtual_cable(self):
+            self.set_status(i18n("正在下载并安装虚拟声卡，请稍候…"), COLOR_WARN)
+            self.window.refresh()
+            try:
+                virtual_cable.install()
+            except virtual_cable.Cancelled:
+                self.set_status(i18n("已取消安装虚拟声卡"), COLOR_WARN)
+                return
+            except virtual_cable.InstallError as error:
+                printt("VB-CABLE: %s", error)
+                sg.popup(
+                    i18n("虚拟声卡自动安装失败，请手动安装：%s") % virtual_cable.HOME_URL
+                )
+                return
+            # The new device takes a moment to reach the audio system.
+            _, values = self.window.read(timeout=0)
+            cable = ""
+            for _ in range(10):
+                self.refresh_device_lists(values)
+                cable = find_virtual_cable(self.output_devices)
+                if cable:
+                    break
+                time.sleep(1)
+            if not cable:
+                sg.popup(i18n("虚拟声卡已安装，重启电脑后生效。重启后再打开本程序即可。"))
+                return
+            self.window["sg_output_device"].Update(value=cable)
+            self.window["install_cable"].update(visible=False)
+            self.set_status(i18n("虚拟声卡已装好，输出设备已自动选好"), COLOR_IDLE)
+            sg.popup(
+                i18n(
+                    "虚拟声卡已装好，输出设备已自动选为 %s。\n\n"
+                    "最后一步：在游戏或语音软件的设置里，把麦克风改成 CABLE Output。"
+                )
+                % cable
+            )
 
         # ----------------------------------------------------------- events
 
@@ -566,6 +630,7 @@ if __name__ == "__main__":
             settings["hubert_context"] = self.gui_config.hubert_context
             settings["show_advanced"] = self.show_advanced
             settings["started_ok"] = self.started_ok
+            settings["cable_asked"] = self.cable_asked
             # The devices in use can differ from the form after an MME fallback.
             cfg = self.gui_config
             if cfg.sg_hostapi:
@@ -709,6 +774,8 @@ if __name__ == "__main__":
                     self.set_status(i18n("设置已更改，请重新开始音频转换"), COLOR_WARN)
                 if event in ("reload_devices", "sg_hostapi"):
                     self.refresh_device_lists(values)
+                elif event == "install_cable":
+                    self.install_virtual_cable()
                 elif event == "refresh_models":
                     self.window["pth_path"].update(
                         values=list_models(), value=values["pth_path"]

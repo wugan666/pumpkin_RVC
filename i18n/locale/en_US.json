@@ -366,8 +366,16 @@
     "自动": "Auto",
     "待机 · 未说话（不占用显卡）": "Standby · not speaking (GPU left free)",
     "显卡繁忙，已自动把采样长度加大到 %.2f 秒": "GPU busy: sample length automatically increased to %.2f s",
-    "未检测到虚拟声卡：要让队友听到变声，请先安装 VB-CABLE（见 README）": "No virtual audio cable found: install VB-CABLE so others can hear the converted voice (see README)",
     "麦克风输入过载（削波）：请调低麦克风音量或离麦克风远一点": "Microphone overload (clipping): lower the microphone volume or move away from it",
     "打开软件后自动开始": "Start automatically when the program opens",
-    "总训练轮数": "Total training epochs"
+    "总训练轮数": "Total training epochs",
+    "未检测到虚拟声卡：点“安装虚拟声卡”后队友才能听到变声": "No virtual sound card found: click \"Install virtual sound card\" so others can hear the converted voice",
+    "没有检测到虚拟声卡（VB-CABLE）。\n游戏和语音软件要通过它才能收到变声后的声音。\n\n现在自动下载并安装吗？（免费，约 1MB，安装时请在弹出的窗口里点“是”和“安装”）": "No virtual sound card (VB-CABLE) was found.\nGames and voice chat receive the converted voice through it.\n\nDownload and install it now? (Free, about 1 MB; answer \"Yes\" and \"Install\" in the windows that pop up.)",
+    "安装虚拟声卡": "Install virtual sound card",
+    "正在下载并安装虚拟声卡，请稍候…": "Downloading and installing the virtual sound card, please wait...",
+    "已取消安装虚拟声卡": "Virtual sound card installation cancelled",
+    "虚拟声卡自动安装失败，请手动安装：%s": "Automatic installation of the virtual sound card failed, please install it manually: %s",
+    "虚拟声卡已安装，重启电脑后生效。重启后再打开本程序即可。": "The virtual sound card is installed and will work after a restart. Restart the computer, then open this program again.",
+    "虚拟声卡已装好，输出设备已自动选好": "Virtual sound card installed; the output device has been selected",
+    "虚拟声卡已装好，输出设备已自动选为 %s。\n\n最后一步：在游戏或语音软件的设置里，把麦克风改成 CABLE Output。": "The virtual sound card is installed and the output device is now %s.\n\nLast step: in the settings of your game or voice chat, set the microphone to CABLE Output."
 }
