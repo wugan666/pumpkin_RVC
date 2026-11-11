@@ -1,15 +1,10 @@
 @echo off
+rem Keep every .bat file pure ASCII: cmd misreads batch files that contain
+rem multi-byte text. Messages live in tools\msg\*.txt and are shown with "type".
 chcp 65001 >nul
 cd /d "%~dp0"
-echo ============================================
-echo   RVC 变声器
-echo ============================================
-echo   [1] 实时变声（打游戏 / 语音聊天）
-echo   [2] 克隆音色 / 网页界面
-echo.
-echo   15 秒内不选择将自动进入 [1]
-echo ============================================
-choice /c 12 /n /t 15 /d 1 /m "请输入 1 或 2: "
+type tools\msg\menu.txt
+choice /c 12 /n /t 15 /d 1 /m ">"
 if errorlevel 2 (
     call go-webui.bat
 ) else (

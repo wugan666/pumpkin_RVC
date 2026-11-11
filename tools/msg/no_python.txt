@@ -1,0 +1,4 @@
+
+没有找到 Python 3.12。
+可以让本程序用 winget 自动安装，或者手动从 https://www.python.org/downloads/ 安装 Python 3.12 (64 位)。
+现在自动安装 Python 3.12 吗？按 Y 安装，按 N 退出。

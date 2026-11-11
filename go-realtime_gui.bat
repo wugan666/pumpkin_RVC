@@ -1,4 +1,5 @@
 @echo off
+rem Keep this file pure ASCII; messages live in tools\msg\*.txt.
 chcp 65001 >nul
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
@@ -10,6 +11,6 @@ if errorlevel 1 (
 )
 set "PATH=%SCRIPT_DIR%;%SCRIPT_DIR%\runtime\Scripts;%PATH%"
 set "PYTHONPATH=%SCRIPT_DIR%;%PYTHONPATH%"
-echo 首次启动程序可能需要耐心等待20秒
+type tools\msg\first_start.txt
 runtime\Scripts\python.exe realtime_gui.py
 pause
