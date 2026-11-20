@@ -16,7 +16,8 @@ from scipy import signal
 
 from infer.autopitch import MIN_FRAMES, suggest_transpose
 from infer.hubert import extract_hubert_features
-from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
+from infer.retrieval import retrieve_features
+from tools.cuda_graph import run_cuda_graph
 
 bh, ah = signal.butter(N=5, Wn=48, btype="high", fs=16000)
 
@@ -61,6 +62,19 @@ class Pipeline(object):
         self.t_center = self.sr * self.x_center  # 查询切点位置
         self.t_max = self.sr * self.x_max  # 免查询时长阈值
         self.device = config.device
+        self._index_key = None
+        self._index = self._index_vectors = None
+
+    def load_index(self, path):
+        stat = os.stat(path)
+        key = (os.path.realpath(path), stat.st_mtime_ns, stat.st_size)
+        if key != self._index_key:
+            index = faiss.read_index(path)
+            if index.ntotal < 1:
+                raise ValueError("索引没有音色特征，请使用 added 索引或重新克隆")
+            vectors = index.reconstruct_n(0, index.ntotal)
+            self._index, self._index_vectors, self._index_key = index, vectors, key
+        return self._index, self._index_vectors
 
     def get_f0(
         self,
@@ -173,7 +187,6 @@ class Pipeline(object):
             feats = feats.mean(-1)
         assert feats.dim() == 1, feats.dim()
         feats = feats.view(1, -1)
-        padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
 
         t0 = ttime()
         with torch.no_grad():
@@ -181,7 +194,6 @@ class Pipeline(object):
                 model,
                 feats.to(self.device),
                 version,
-                padding_mask=padding_mask,
             )
         # Protection only matters where retrieval replaced the features.
         use_protect = (
@@ -202,10 +214,7 @@ class Pipeline(object):
             if self.is_half:
                 npy = npy.astype("float32")
 
-            score, ix = index.search(npy, k=8)
-            weight = np.square(1 / score)
-            weight /= weight.sum(axis=1, keepdims=True)
-            npy = np.sum(index_vectors[ix] * np.expand_dims(weight, axis=2), axis=1)
+            npy = retrieve_features(index, index_vectors, npy)
 
             if self.is_half:
                 npy = npy.astype("float16")
@@ -264,9 +273,7 @@ class Pipeline(object):
                 )
             audio1 = synthesized[0, 0].data.cpu().float().numpy()
             del hasp, synthesized
-        del feats, p_len, padding_mask
-        if torch.cuda.is_available() and not cuda_graph_enabled(self.device):
-            torch.cuda.empty_cache()
+        del feats, p_len
         t2 = ttime()
         times[0] += t1 - t0
         times[2] += t2 - t1
@@ -295,26 +302,16 @@ class Pipeline(object):
         that moves this audio into the target voice's range; the value used is
         left in ``self.applied_f0_up_key``."""
         self.applied_f0_up_key = f0_up_key
-        if (
-            file_index != ""
-            and os.path.exists(file_index)
-            and index_rate != 0
-        ):
-            try:
-                index = faiss.read_index(file_index)
-                index_vectors = index.reconstruct_n(0, index.ntotal)
-            except:
-                traceback.print_exc()
-                index = index_vectors = None
+        if file_index and index_rate != 0:
+            index, index_vectors = self.load_index(file_index)
         else:
             index = index_vectors = None
         audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
         opt_ts = []
         if audio_pad.shape[0] > self.t_max:
-            audio_sum = np.zeros_like(audio)
-            for i in range(self.window):
-                audio_sum += np.abs(audio_pad[i : i - self.window])
+            cumulative = np.pad(np.cumsum(np.abs(audio_pad), dtype=np.float64), (1, 0))
+            audio_sum = cumulative[self.window : self.window + audio.size] - cumulative[:audio.size]
             for t in range(self.t_center, audio.shape[0], self.t_center):
                 opt_ts.append(
                     t
@@ -381,6 +378,8 @@ class Pipeline(object):
             convert(audio_pad[t:], t // self.window if t is not None else None, None)
         )
         audio_opt = np.concatenate(audio_opt)
+        if not audio_opt.size or not np.isfinite(audio_opt).all():
+            raise ValueError("转换未生成有效音频，请检查模型和索引是否匹配")
         if rms_mix_rate != 1:
             audio_opt = change_rms(audio, 16000, audio_opt, tgt_sr, rms_mix_rate)
         if tgt_sr != resample_sr >= 16000:
@@ -393,6 +392,4 @@ class Pipeline(object):
             max_int16 /= audio_max
         audio_opt = (audio_opt * max_int16).astype(np.int16)
         del pitch, pitchf, voiced, sid
-        if torch.cuda.is_available() and not cuda_graph_enabled(self.device):
-            torch.cuda.empty_cache()
         return audio_opt

@@ -19,8 +19,8 @@ AUDIO_EXTENSIONS = {
 # The name becomes a folder, a model file and a faiss index path; faiss cannot
 # open non-ASCII paths on Windows, so the name is kept ASCII.
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
-MIN_SECONDS = 10
-RECOMMENDED_SECONDS = 60
+MIN_SECONDS = 30
+RECOMMENDED_SECONDS = 180
 
 
 def validate_name(name):
@@ -50,10 +50,12 @@ def audio_seconds(path):
         import av
 
         with av.open(path) as container:
+            stream = container.streams.audio[0]
+            if stream.duration and stream.time_base:
+                return float(stream.duration * stream.time_base)
             if container.duration:
                 return container.duration / av.time_base
-            stream = container.streams.audio[0]
-            return float(stream.duration * stream.time_base)
+            return sum(frame.samples / frame.sample_rate for frame in container.decode(stream))
     except Exception:
         return 0.0
 
@@ -65,9 +67,8 @@ def clean_folder_path(folder):
 def prepare_dataset(dataset_dir, files=None, recording=None, folder=None):
     """Gather the training audio and return ``(trainset_dir, count, seconds)``.
 
-    A folder on its own is trained in place. Uploads and recordings are copied
-    into ``dataset_dir``, which is owned by this flow and rebuilt on every run
-    so that re-cloning a name never mixes in the previous attempt's audio.
+    A folder on its own is read in place. Uploads and recordings are copied
+    into a new directory, leaving every earlier recording intact.
     """
     folder = clean_folder_path(folder)
     uploads = [path for path in map(_uploaded_path, files or []) if path]
@@ -93,11 +94,18 @@ def prepare_dataset(dataset_dir, files=None, recording=None, folder=None):
     if not uploads and not folder_files:
         raise ValueError("请先上传人声音频、录一段音，或填写素材文件夹路径")
 
+    sources = list(dict.fromkeys(folder_files + uploads))
+    durations = [audio_seconds(path) for path in sources]
+    if any(duration <= 0 for duration in durations):
+        raise ValueError("有素材无法读取或不包含音频，请重新上传有效录音")
+    seconds = sum(durations)
+    if seconds < MIN_SECONDS:
+        raise ValueError(
+            "素材总时长只有 %.0f 秒，至少需要 %d 秒，建议 3~10 分钟"
+            % (seconds, MIN_SECONDS)
+        )
     if uploads:
-        sources = folder_files + uploads
-        if os.path.isdir(dataset_dir):
-            shutil.rmtree(dataset_dir)
-        os.makedirs(dataset_dir)
+        os.makedirs(dataset_dir, exist_ok=False)
         for number, source in enumerate(sources):
             stem = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(source))
             shutil.copyfile(
@@ -105,15 +113,7 @@ def prepare_dataset(dataset_dir, files=None, recording=None, folder=None):
             )
         trainset_dir = dataset_dir
     else:
-        sources = folder_files
         trainset_dir = os.path.abspath(folder)
-
-    seconds = sum(audio_seconds(path) for path in sources)
-    if 0 < seconds < MIN_SECONDS:
-        raise ValueError(
-            "素材总时长只有 %.0f 秒，至少需要 %d 秒，建议 1~10 分钟以上"
-            % (seconds, MIN_SECONDS)
-        )
     return trainset_dir, len(sources), seconds
 
 
@@ -122,32 +122,46 @@ def describe_dataset(count, seconds):
         return "素材：%d 个文件" % count
     text = "素材：%d 个文件，共 %d 分 %02d 秒" % (count, seconds // 60, seconds % 60)
     if seconds < RECOMMENDED_SECONDS:
-        text += "\n提示：素材不足 1 分钟，音色相似度会比较有限，建议准备 1~10 分钟以上的干净人声"
+        text += "\n提示：素材不足 3 分钟，相似度受限；建议准备 3~10 分钟同一人的干净人声，覆盖不同句子和语气"
     return text
 
 
 # ---------------------------------------------------------------- epochs
 
-# Training slices the material into pieces; about this many reach each epoch
-# per second of audio (measured: 36 of 60 s at batch size 4).
-SEGMENTS_PER_SECOND = 0.6
-# With little material an epoch is only a few steps, so a fixed epoch count
-# under-trains. On a 1 minute clone the similarity to the real voice kept
-# rising up to roughly 360 steps and was flat after that.
-MIN_STEPS = 400
-MAX_EPOCH_FACTOR = 4
-GPU_CACHE_SECONDS = 600
+# Conservative cache limit; training also checks available GPU memory.
+GPU_CACHE_SECONDS = 180
 
 
-def plan_epochs(preset_epochs, seconds, batch_size):
-    """Epoch count for a preset, raised when the material is short."""
-    if seconds <= 0:
-        return preset_epochs
-    steps_per_epoch = max(1, int(seconds * SEGMENTS_PER_SECOND / max(1, batch_size)))
-    # the quick preset stays quick: it gets a proportionally smaller floor
-    steps = MIN_STEPS * min(preset_epochs, 50) // 50
-    needed = -(-steps // steps_per_epoch)
-    return int(min(max(preset_epochs, needed), preset_epochs * MAX_EPOCH_FACTOR))
+def training_steps(preset_epochs):
+    """Minimum optimizer steps; the trainer computes epochs from real batches."""
+    return 160 if preset_epochs <= 20 else 800 if preset_epochs <= 80 else 1600
+
+
+def voiced_seconds(exp_dir):
+    import numpy as np
+
+    directory = os.path.join(exp_dir, "2c_f0_voiced")
+    if not os.path.isdir(directory):
+        return 0.0
+    return sum(
+        np.load(os.path.join(directory, name), mmap_mode="r").size
+        for name in os.listdir(directory) if name.endswith(".npy")
+    ) / 100
+
+
+def available_name(name, project_root, weight_root):
+    """Preserve previous voices and never resume a different recording's run."""
+    base = validate_name(name)
+    candidate = base
+    suffix = 1
+    while (
+        os.path.exists(os.path.join(project_root, "logs", candidate))
+        or os.path.exists(os.path.join(project_root, "datasets", candidate))
+        or os.path.exists(os.path.join(weight_root, candidate + ".pth"))
+    ):
+        suffix += 1
+        candidate = base[:40] + "_" + str(suffix)
+    return candidate
 
 
 # ---------------------------------------------------------------- quality
@@ -181,7 +195,7 @@ def analyze_file(path):
 
 def quality_report(paths, max_files=30):
     """Warnings about the training audio as a list of human readable lines."""
-    step = max(1, len(paths) // max_files)
+    step = max(1, -(-len(paths) // max_files))
     stats = [s for s in (analyze_file(p) for p in paths[::step]) if s]
     if not stats:
         return []
@@ -206,7 +220,7 @@ def quality_report(paths, max_files=30):
     if silence > 0.6:
         warnings.append("⚠ 素材中大部分是静音（%d%%），有效人声偏少" % round(silence * 100))
     if not warnings:
-        warnings.append("✓ 素材质量检查通过（无削波，背景干净）")
+        warnings.append("✓ 未发现明显削波、低音量或过多静音；仍需播放确认无伴奏、混响和其他人声")
     return warnings
 
 
@@ -226,6 +240,7 @@ INTERMEDIATE_DIRS = (
     "1_16k_wavs",
     "2a_f0",
     "2b-f0nsf",
+    "2c_f0_voiced",
     "3_feature256",
     "3_feature768",
 )
@@ -243,6 +258,9 @@ def cleanup_experiment(exp_dir):
     for name in os.listdir(exp_dir):
         path = os.path.join(exp_dir, name)
         if os.path.isfile(path) and re.match(r"^[GD]_\d+\.pth$", name):
+            freed += os.path.getsize(path)
+            os.remove(path)
+        elif os.path.isfile(path) and re.match(r"^total_fea(?:_spkid\d+)?\.npy$", name):
             freed += os.path.getsize(path)
             os.remove(path)
         elif os.path.isdir(path) and name in INTERMEDIATE_DIRS:

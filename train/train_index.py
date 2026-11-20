@@ -2,7 +2,6 @@ import os
 import platform
 import sys
 import traceback
-import glob
 import json
 
 import faiss
@@ -36,11 +35,6 @@ def log(message):
 
 with open(log_path, "w", encoding="utf8"):
     pass
-
-
-def newest_index(pattern):
-    paths = [path for path in glob.glob(pattern) if os.path.isfile(path)]
-    return max(paths, key=os.path.getmtime) if paths else ""
 
 
 def speaker_scope(message, speaker_id):
@@ -126,48 +120,14 @@ if not feature_groups or not any(feature_groups.values()):
 def train_one_speaker(speaker_id, paths):
     scope = lambda message: speaker_scope(message, speaker_id)
     features = [np.load(path) for path in paths]
-    big_npy = np.concatenate(features, 0)
+    big_npy = np.ascontiguousarray(np.concatenate(features, 0), dtype=np.float32)
+    if not len(big_npy) or not np.isfinite(big_npy).all():
+        raise ValueError("音色特征为空或包含无效数值，请重新提取特征")
+    del features
     big_npy = big_npy[np.random.permutation(big_npy.shape[0])]
     suffix = "" if speaker_id is None else "_spkid%s" % speaker_id
     total_path = os.path.join(exp_dir, "total_fea%s.npy" % suffix)
     np.save(total_path, big_npy)
-
-    trained_pattern = os.path.join(
-        exp_dir,
-        "trained_IVF*_Flat_nprobe_*_%s_%s%s.index"
-        % (exp_name, version, suffix),
-    )
-    added_pattern = os.path.join(
-        exp_dir,
-        "added_IVF*_Flat_nprobe_*_%s_%s%s.index"
-        % (exp_name, version, suffix),
-    )
-    existing_trained_path = newest_index(trained_pattern)
-    existing_added_path = newest_index(added_pattern)
-    if not existing_added_path:
-        existing_added_path = newest_index(
-            os.path.join(
-                outside_index_root,
-                "%s_*added_IVF*_Flat_nprobe_*_%s_%s%s.index"
-                % (exp_name, exp_name, version, suffix),
-            )
-        )
-    if existing_added_path:
-        if existing_trained_path:
-            log(
-                scope(
-                    i18n("[索引训练][跳过] trained索引已存在：%s")
-                    % os.path.basename(existing_trained_path)
-                )
-            )
-        log(
-            scope(
-                i18n("[索引训练][跳过] added索引已存在：%s")
-                % os.path.basename(existing_added_path)
-            )
-        )
-        link_added_index(existing_added_path, speaker_id)
-        return
 
     if big_npy.shape[0] > 200000:
         log(
@@ -180,7 +140,8 @@ def train_one_speaker(speaker_id, paths):
             big_npy = MiniBatchKMeans(
                 n_clusters=10000,
                 verbose=False,
-                batch_size=256 * n_cpu,
+                batch_size=256 * max(1, min(n_cpu, 16)),
+                random_state=0,
                 compute_labels=False,
                 init="random",
             ).fit(big_npy).cluster_centers_
@@ -194,31 +155,19 @@ def train_one_speaker(speaker_id, paths):
 
     n_ivf = max(1, min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39))
     log(scope(i18n("[索引训练] 特征形状：%s | IVF数量：%s") % (big_npy.shape, n_ivf)))
-    if existing_trained_path:
-        trained_path = existing_trained_path
-        index = faiss.read_index(trained_path)
-        index_ivf = faiss.extract_index_ivf(index)
-        index_ivf.nprobe = 1
-        log(
-            scope(
-                i18n("[索引训练][跳过] trained索引已存在：%s")
-                % os.path.basename(trained_path)
-            )
-        )
-    else:
-        index = faiss.index_factory(
-            256 if version == "v1" else 768, "IVF%s,Flat" % n_ivf
-        )
-        index_ivf = faiss.extract_index_ivf(index)
-        index_ivf.nprobe = 1
-        trained_path = os.path.join(
-            exp_dir,
-            "trained_IVF%s_Flat_nprobe_%s_%s_%s%s.index"
-            % (n_ivf, index_ivf.nprobe, exp_name, version, suffix),
-        )
-        log(scope(i18n("[索引训练] 正在训练索引")))
-        index.train(big_npy)
-        faiss.write_index(index, trained_path)
+    index = faiss.index_factory(
+        256 if version == "v1" else 768, "IVF%s,Flat" % n_ivf
+    )
+    index_ivf = faiss.extract_index_ivf(index)
+    index_ivf.nprobe = min(8, n_ivf)
+    trained_path = os.path.join(
+        exp_dir,
+        "trained_IVF%s_Flat_nprobe_%s_%s_%s%s.index"
+        % (n_ivf, index_ivf.nprobe, exp_name, version, suffix),
+    )
+    log(scope(i18n("[索引训练] 正在训练索引")))
+    index.train(big_npy)
+    faiss.write_index(index, trained_path)
 
     log(scope(i18n("[索引训练] 正在写入特征向量")))
     starts = list(range(0, big_npy.shape[0], 8192))

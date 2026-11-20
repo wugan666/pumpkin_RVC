@@ -38,19 +38,20 @@ def get_index_path_from_model(sid, speaker_id=None):
                     and indexed_speaker_id != target_speaker_id
                 ):
                     continue
-                standard_match = (
-                    lower_index.startswith(lower_experiment + "_added_")
-                    or ("_" + lower_experiment + "_v1") in lower_index
-                    or ("_" + lower_experiment + "_v2") in lower_index
-                )
-                exact_model_match = model_stem.lower() in lower_index
+                standard_match = bool(re.search(
+                    r"^(?:" + re.escape(lower_experiment) + r"_)?added_IVF\d+_Flat_nprobe_\d+_"
+                    + re.escape(lower_experiment) + r"_v[12](?:_spkid\d+)?$",
+                    lower_index,
+                    re.IGNORECASE,
+                ))
+                exact_model_match = lower_index == model_stem.lower()
                 if standard_match or exact_model_match:
                     path = os.path.abspath(os.path.join(root, name))
                     score = (
                         0 if indexed_speaker_id == target_speaker_id else 1,
                         0 if standard_match else 1,
-                        0 if os.path.abspath(index_root) == os.path.abspath(roots[0]) else 1,
                         -os.path.getmtime(path),
+                        0 if os.path.abspath(index_root) == os.path.abspath(roots[0] or "assets/indices") else 1,
                         path.lower(),
                     )
                     candidates.append((score, path))

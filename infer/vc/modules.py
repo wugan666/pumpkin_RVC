@@ -1,5 +1,7 @@
 import traceback
 import logging
+from functools import wraps
+from threading import RLock
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,14 @@ def speaker_selector_updates(checkpoint, n_spk):
     )
 
 
+def synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class VC:
     def __init__(self, config):
         self.n_spk = None
@@ -99,135 +109,75 @@ class VC:
         self.hubert_model = None
 
         self.config = config
+        self.lock = RLock()
+        self._model_key = None
 
+    @synchronized
     def get_vc(self, sid, *to_return_protect):
-        logger.info("%s: %s", i18n("选择模型"), sid)
-
-        to_return_protect0 = {
-            "visible": self.if_f0 != 0,
-            "value": (
-                to_return_protect[0] if self.if_f0 != 0 and to_return_protect else 0.5
-            ),
-            "__type__": "update",
-        }
-        to_return_protect1 = {
-            "visible": self.if_f0 != 0,
-            "value": (
-                to_return_protect[1] if self.if_f0 != 0 and to_return_protect else 0.33
-            ),
-            "__type__": "update",
-        }
-
-        if sid == "" or sid == []:
-            if (
-                self.hubert_model is not None
-            ):  # 考虑到轮询, 需要加个判断看是否 sid 是由有模型切换到无模型的
-                logger.info(i18n("清理模型缓存"))
-                clear_cuda_graph_cache(self.net_g)
-                clear_cuda_graph_cache(self.hubert_model)
-                del (self.net_g, self.n_spk, self.hubert_model, self.tgt_sr)  # ,cpt
-                # The pipeline holds the pitch extractor (RMVPE / FCPE) as well.
-                self.pipeline = None
-                self.hubert_model = self.net_g = self.n_spk = self.hubert_model = (
-                    self.tgt_sr
-                ) = None
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                ###楼下不这么折腾清理不干净
-                self.if_f0 = self.cpt.get("f0", 1)
-                self.version = self.cpt.get("version", "v1")
-                if self.version == "v1":
-                    if self.if_f0 == 1:
-                        self.net_g = SynthesizerTrnMs256NSFsid(
-                            *self.cpt["config"], is_half=self.config.is_half
-                        )
-                    else:
-                        self.net_g = SynthesizerTrnMs256NSFsid_nono(*self.cpt["config"])
-                elif self.version == "v2":
-                    if self.if_f0 == 1:
-                        self.net_g = SynthesizerTrnMs768NSFsid(
-                            *self.cpt["config"], is_half=self.config.is_half
-                        )
-                    else:
-                        self.net_g = SynthesizerTrnMs768NSFsid_nono(*self.cpt["config"])
-                del self.net_g, self.cpt
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            return (
-                {"visible": False, "__type__": "update"},
-                {"visible": False, "value": None, "__type__": "update"},
-                {
-                    "visible": True,
-                    "value": to_return_protect0,
-                    "__type__": "update",
-                },
-                {
-                    "visible": True,
-                    "value": to_return_protect1,
-                    "__type__": "update",
-                },
-                "",
-                "",
-            )
-        person = f'{os.getenv("weight_root")}/{sid}'
-        logger.info("%s: %s", i18n("正在加载模型"), person)
-
-        if self.net_g is not None:
+        if not sid:
             clear_cuda_graph_cache(self.net_g)
+            clear_cuda_graph_cache(self.hubert_model)
+            self.net_g = self.hubert_model = self.pipeline = self.cpt = None
+            self.n_spk = self.tgt_sr = self.if_f0 = self.f0_median = None
+            self._model_key = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            hidden = {"visible": False, "__type__": "update"}
+            return hidden, dict(hidden, value=None), dict(hidden), dict(hidden), "", ""
 
-        self.cpt = torch.load(person, map_location="cpu")
-        self.tgt_sr = self.cpt["config"][-1]
-        self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]  # n_spk
-        self.if_f0 = self.cpt.get("f0", 1)
-        self.version = self.cpt.get("version", "v1")
-        self.f0_median = model_f0_median(self.cpt, sid)
-
-        synthesizer_class = {
-            ("v1", 1): SynthesizerTrnMs256NSFsid,
-            ("v1", 0): SynthesizerTrnMs256NSFsid_nono,
-            ("v2", 1): SynthesizerTrnMs768NSFsid,
-            ("v2", 0): SynthesizerTrnMs768NSFsid_nono,
-        }
-
-        self.net_g = synthesizer_class.get(
-            (self.version, self.if_f0), SynthesizerTrnMs256NSFsid
-        )(*self.cpt["config"], is_half=self.config.is_half)
-
-        del self.net_g.enc_q
-
-        self.net_g.load_state_dict(self.cpt["weight"], strict=False)
-        self.net_g.eval().to(self.config.device)
-        if self.config.is_half:
-            self.net_g = self.net_g.half()
-        else:
-            self.net_g = self.net_g.float()
-
-        self.pipeline = Pipeline(self.tgt_sr, self.config)
-        n_spk = self.cpt["config"][-3]
-        speaker_info = normalized_speaker_info(self.cpt, n_spk)
-        speaker_slider_update, speaker_dropdown_update = speaker_selector_updates(
-            self.cpt, n_spk
-        )
-        default_speaker_id = speaker_info[0]["id"] if speaker_info else 0
-        index = {
-            "value": get_index_path_from_model(sid, default_speaker_id),
-            "__type__": "update",
-        }
-        logger.info("%s: %s", i18n("选择索引"), index["value"])
-
-        return (
-            (
-                speaker_slider_update,
-                speaker_dropdown_update,
-                to_return_protect0,
-                to_return_protect1,
-                index,
-                index,
+        person = os.path.abspath(os.path.join(os.getenv("weight_root", "assets/weights"), sid))
+        stat = os.stat(person)
+        key = (person, stat.st_mtime_ns, stat.st_size)
+        if key != self._model_key:
+            logger.info("%s: %s", i18n("正在加载模型"), person)
+            checkpoint = torch.load(person, map_location="cpu")
+            checkpoint["config"][-3] = checkpoint["weight"]["emb_g.weight"].shape[0]
+            if_f0 = checkpoint.get("f0", 1)
+            version = checkpoint.get("version", "v1")
+            synthesizer_class = {
+                ("v1", 1): SynthesizerTrnMs256NSFsid,
+                ("v1", 0): SynthesizerTrnMs256NSFsid_nono,
+                ("v2", 1): SynthesizerTrnMs768NSFsid,
+                ("v2", 0): SynthesizerTrnMs768NSFsid_nono,
+            }
+            clear_cuda_graph_cache(self.net_g)
+            self.net_g = None
+            self._model_key = None
+            net_g = synthesizer_class[(version, if_f0)](
+                *checkpoint["config"], is_half=self.config.is_half
             )
-            if to_return_protect
-            else speaker_slider_update
-        )
+            del net_g.enc_q
+            net_g.load_state_dict(checkpoint["weight"], strict=False)
+            net_g = net_g.eval().to(device=self.config.device, dtype=self.config.dtype)
+            target_sr = checkpoint["config"][-1]
+            if self.pipeline is None or self.tgt_sr != target_sr:
+                pipeline = Pipeline(target_sr, self.config)
+                if self.pipeline is not None:
+                    for attr in ("model_rmvpe", "model_fcpe"):
+                        if hasattr(self.pipeline, attr):
+                            setattr(pipeline, attr, getattr(self.pipeline, attr))
+                self.pipeline = pipeline
+            self.cpt, self.net_g = checkpoint, net_g
+            self.tgt_sr, self.if_f0, self.version = target_sr, if_f0, version
+            self.n_spk = checkpoint["config"][-3]
+            self.f0_median = model_f0_median(checkpoint, sid)
+            self._model_key = key
 
+        slider, dropdown = speaker_selector_updates(self.cpt, self.n_spk)
+        speaker_info = normalized_speaker_info(self.cpt, self.n_spk)
+        speaker_id = speaker_info[0]["id"] if speaker_info else 0
+        index = {"value": get_index_path_from_model(sid, speaker_id), "__type__": "update"}
+        protect = [
+            {
+                "visible": self.if_f0 != 0,
+                "value": to_return_protect[i] if self.if_f0 and len(to_return_protect) > i else 0.5,
+                "__type__": "update",
+            }
+            for i in range(2)
+        ]
+        return (slider, dropdown, *protect, index, dict(index)) if to_return_protect else slider
+
+    @synchronized
     def vc_single(
         self,
         sid,
@@ -243,9 +193,17 @@ class VC:
     ):
         if input_audio_path is None:
             return inference_status("单次推理", "等待输入", i18n("请上传音频文件")), None
-        f0_up_key = int(f0_up_key)
         try:
+            if self.net_g is None or self.pipeline is None:
+                raise ValueError("请先选择或克隆一个音色")
+            if not 0 <= int(sid) < self.n_spk:
+                raise ValueError("说话人编号不属于当前模型，请重新选择音色")
+            f0_up_key = int(f0_up_key)
             audio = load_audio(input_audio_path, 16000)
+            if audio.size < 1600 or not np.isfinite(audio).all():
+                raise ValueError("录音为空、过短或损坏，请重新录制至少一秒的人声")
+            if np.max(np.abs(audio)) < 1e-5:
+                raise ValueError("录音是静音，请检查麦克风后重新录制")
             audio_max = np.abs(audio).max() / 0.95
             if audio_max > 1:
                 audio /= audio_max
@@ -320,7 +278,7 @@ class VC:
         except Exception:
             info = traceback.format_exc()
             logger.warning(info)
-            return inference_status("单次推理", "失败", info), (None, None)
+            return inference_status("单次推理", "失败", info), None
 
     def vc_multi(
         self,
@@ -336,6 +294,7 @@ class VC:
         rms_mix_rate,
         protect,
         format1,
+        model_name=None,
     ):
         try:
             dir_path = (
@@ -381,17 +340,20 @@ class VC:
             failures = []
             for idx, path in enumerate(paths):
                 item_failed = False
-                info, opt = self.vc_single(
-                    sid,
-                    path,
-                    f0_up_key,
-                    f0_method,
-                    file_index,
-                    index_rate,
-                    resample_sr,
-                    rms_mix_rate,
-                    protect,
-                )
+                with self.lock:
+                    if model_name:
+                        self.get_vc(model_name)
+                    info, opt = self.vc_single(
+                        sid,
+                        path,
+                        f0_up_key,
+                        f0_method,
+                        file_index,
+                        index_rate,
+                        resample_sr,
+                        rms_mix_rate,
+                        protect,
+                    )
                 if opt and opt[0] is not None and opt[1] is not None:
                     try:
                         tgt_sr, audio_opt = opt

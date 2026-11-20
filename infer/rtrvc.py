@@ -3,6 +3,8 @@ import traceback
 from collections import deque
 from time import time as ttime
 import faiss
+from infer.retrieval import retrieve_features
+
 import numpy as np
 import parselmouth
 import torch
@@ -424,24 +426,13 @@ class RVC:
                 if self.if_f0 == 1 and self.protect < 0.5:
                     feats0 = feats.clone()
                 npy = feats[0][skip_head // 2 :].cpu().numpy().astype("float32")
-                score, ix = self.index.search(npy, k=8)
-                if (ix >= 0).all():
-                    weight = np.square(1 / score)
-                    weight /= weight.sum(axis=1, keepdims=True)
-                    npy = np.sum(
-                        self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1
-                    )
-                    if self.config.is_half:
-                        npy = npy.astype("float16")
-                    feats[0][skip_head // 2 :] = (
-                        torch.from_numpy(npy).unsqueeze(0).to(self.device)
-                        * self.index_rate
-                        + (1 - self.index_rate) * feats[0][skip_head // 2 :]
-                    )
-                else:
-                    printt(
-                        i18n("索引无效：必须使用added_xxxx.index，不能使用trained_xxxx.index")
-                    )
+                npy = retrieve_features(self.index, self.big_npy, npy)
+                if self.config.is_half:
+                    npy = npy.astype("float16")
+                feats[0][skip_head // 2 :] = (
+                    torch.from_numpy(npy).to(self.device) * self.index_rate
+                    + (1 - self.index_rate) * feats[0][skip_head // 2 :]
+                )
             else:
                 if report_status:
                     printt(i18n("索引检索失败或未启用"))

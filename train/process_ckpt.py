@@ -2,6 +2,7 @@ import os
 import sys
 import traceback
 import json
+import tempfile
 from collections import OrderedDict
 
 import torch
@@ -69,7 +70,16 @@ def savee(ckpt, sr, if_f0, name, epoch, version, hps):
             f0_median = dataset_f0_median(getattr(hps, "model_dir", ""))
             if f0_median:
                 opt["f0_median"] = f0_median
-        torch.save(opt, "assets/weights/%s.pth" % name)
+        weight_root = os.getenv("weight_root", "assets/weights")
+        os.makedirs(weight_root, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=weight_root, suffix=".tmp", delete=False) as handle:
+            temporary_path = handle.name
+        try:
+            torch.save(opt, temporary_path)
+            os.replace(temporary_path, os.path.join(weight_root, "%s.pth" % name))
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
         return i18n("成功")
     except:
         return traceback.format_exc()

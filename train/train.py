@@ -137,7 +137,7 @@ def load_pretrained_generator(model, path):
 
 def main():
     n_gpus = torch.cuda.device_count()
-    single_cuda = torch.cuda.is_available() and n_gpus == 1
+    single_device = n_gpus <= 1
 
     if n_gpus < 1:
         # patch to unblock people without gpus. there is probably a better way.
@@ -145,7 +145,7 @@ def main():
         n_gpus = 1
     logger = utils.get_logger(hps.model_dir)
     logger.info(i18n("训练设备规则选择的精度：%s"), training_dtype)
-    if single_cuda:
+    if single_device:
         run(0, 1, hps, logger, False)
         return
     os.environ["MASTER_ADDR"] = "localhost"
@@ -161,6 +161,8 @@ def main():
 
     for i in range(n_gpus):
         children[i].join()
+    if any(child.exitcode != 0 for child in children):
+        raise RuntimeError("训练进程失败，请查看训练日志")
 
 
 def run(rank, n_gpus, hps, logger, use_ddp):
@@ -189,9 +191,9 @@ def run(rank, n_gpus, hps, logger, use_ddp):
         train_dataset = TextAudioLoader(hps.data.training_files, hps.data)
     train_sampler = DistributedBucketSampler(
         train_dataset,
-        hps.train.batch_size * n_gpus,
+        hps.train.batch_size,
         # [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1200,1400],  # 16s
-        [100, 200, 300, 400, 500, 600, 700, 800, 900],  # 16s
+        [40, 100, 200, 300, 400, 500, 600, 700, 800, 900],
         num_replicas=n_gpus,
         rank=rank,
         shuffle=True,
@@ -204,7 +206,9 @@ def run(rank, n_gpus, hps, logger, use_ddp):
         collate_fn = TextAudioCollate()
     # A few-minute dataset has only a handful of batches; four loader
     # processes with eight prefetched batches each would mostly sit idle.
-    loader_workers = max(1, min(4, (os.cpu_count() or 4) // 2, len(train_sampler)))
+    if not len(train_sampler):
+        raise ValueError("没有足够长的有效人声片段，请重新录制后克隆")
+    loader_workers = 0 if hps.if_cache_data_in_gpu else min(4, (os.cpu_count() or 4) // 2, len(train_sampler))
     train_loader = DataLoader(
         train_dataset,
         num_workers=loader_workers,
@@ -212,9 +216,16 @@ def run(rank, n_gpus, hps, logger, use_ddp):
         pin_memory=True,
         collate_fn=collate_fn,
         batch_sampler=train_sampler,
-        persistent_workers=True,
-        prefetch_factor=8,
+        persistent_workers=loader_workers > 0,
+        prefetch_factor=2 if loader_workers else None,
     )
+    min_steps = int(getattr(hps.train, "min_steps", 0))
+    hps.total_epoch = max(hps.total_epoch, -(-min_steps // len(train_loader)))
+    hps.train.epochs = hps.total_epoch
+    if rank == 0:
+        logger.info("有效片段：%s | 每轮批次：%s | 总轮数：%s | 计划更新步数：%s",
+                    len(train_dataset), len(train_loader), hps.total_epoch,
+                    hps.total_epoch * len(train_loader))
     if hps.if_f0 == 1:
         net_g = RVC_Model_f0(
             hps.data.filter_length // 2 + 1,
@@ -335,6 +346,11 @@ def run(rank, n_gpus, hps, logger, use_ddp):
             )
         scheduler_g.step()
         scheduler_d.step()
+    if rank == 0:
+        writer.close()
+        writer_eval.close()
+    if use_ddp:
+        dist.destroy_process_group()
 
 
 def train_and_evaluate(
@@ -664,16 +680,10 @@ def train_and_evaluate(
             ckpt = net_g.module.state_dict()
         else:
             ckpt = net_g.state_dict()
-        logger.info(
-            i18n("正在保存最终检查点：%s")
-            % (
-                savee(
-                    ckpt, hps.sample_rate, hps.if_f0, hps.name, epoch, hps.version, hps
-                )
-            )
-        )
-        sleep(1)
-        os._exit(0)
+        result = savee(ckpt, hps.sample_rate, hps.if_f0, hps.name, epoch, hps.version, hps)
+        if result != i18n("成功"):
+            raise RuntimeError(result)
+        logger.info(i18n("正在保存最终检查点：%s") % result)
 
 
 if __name__ == "__main__":

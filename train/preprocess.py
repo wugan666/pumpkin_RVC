@@ -60,6 +60,8 @@ class PreProcess:
         os.makedirs(self.wavs16k_dir, exist_ok=True)
 
     def norm_write(self, tmp_audio, output_key, idx1):
+        if tmp_audio.size < int(self.sr * 0.5):
+            return False
         tmp_max = np.abs(tmp_audio).max()
         if not np.isfinite(tmp_max) or tmp_max <= 0 or tmp_max > 2.5:
             println(
@@ -104,9 +106,9 @@ class PreProcess:
                         idx1 += 1
                     else:
                         tmp_audio = audio[start:]
+                        self.norm_write(tmp_audio, output_key, idx1)
                         idx1 += 1
                         break
-            self.norm_write(tmp_audio, output_key, idx1)
             if should_report(progress_index, total):
                 println(
                     i18n("[数据切分] 进度：%s/%s | %s")

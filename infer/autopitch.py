@@ -21,10 +21,11 @@ LOCK_FRAMES = 300
 
 def dataset_f0_median(exp_dir, max_files=400):
     """Median F0 in Hz of an experiment's extracted pitch, or None."""
-    files = sorted(glob.glob(os.path.join(exp_dir, "2b-f0nsf", "*.npy")))
+    folder = "2c_f0_voiced" if os.path.isdir(os.path.join(exp_dir, "2c_f0_voiced")) else "2b-f0nsf"
+    files = sorted(glob.glob(os.path.join(exp_dir, folder, "*.npy")))
     if not files:
         return None
-    step = max(1, len(files) // max_files)
+    step = max(1, -(-len(files) // max_files))
     values = []
     for path in files[::step]:
         try:

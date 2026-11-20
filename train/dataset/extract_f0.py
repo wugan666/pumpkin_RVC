@@ -98,6 +98,9 @@ class FeatureInput(object):
                 )
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         f0 = np.asarray(f0)
+        voiced_dir = os.path.join(exp_dir, "2c_f0_voiced")
+        os.makedirs(voiced_dir, exist_ok=True)
+        np.save(os.path.join(voiced_dir, os.path.basename(path) + ".npy"), f0[f0 > 0])
         try:
             uv = f0 == 0
             f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
@@ -199,7 +202,9 @@ if __name__ == "__main__":
         if not paths:
             featureInput.go([], f0method, 1)
         else:
-            worker_count = min(max(1, n_p), len(paths))
+            # Each RMVPE process owns a full neural network; CPU replication
+            # oversubscribes threads and can exhaust RAM on long recordings.
+            worker_count = 1 if f0method == "rmvpe" else min(max(1, n_p), len(paths))
             ps = []
             for i in range(worker_count):
                 p = Process(

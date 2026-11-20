@@ -4,6 +4,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import soundfile as sf
 import numpy as np
 import torch
 import torch.utils.data
@@ -36,15 +37,14 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         Filter text & store spec lengths
         """
         # Store spectrogram lengths for Bucketing
-        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
-        # spec_length = wav_length // hop_length
+        # Read actual frames: float32 and PCM WAV use different byte widths.
         audiopaths_and_text_new = []
         lengths = []
         for record in self.audiopaths_and_text:
             audiopath, text, pitch, pitchf, dv = record[:5]
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_and_text_new.append([audiopath, text, pitch, pitchf, dv])
-                lengths.append(os.path.getsize(audiopath) // (3 * self.hop_length))
+                lengths.append(sf.info(audiopath).frames // self.hop_length)
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
 
@@ -245,15 +245,14 @@ class TextAudioLoader(torch.utils.data.Dataset):
         Filter text & store spec lengths
         """
         # Store spectrogram lengths for Bucketing
-        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
-        # spec_length = wav_length // hop_length
+        # Read actual frames: float32 and PCM WAV use different byte widths.
         audiopaths_and_text_new = []
         lengths = []
         for record in self.audiopaths_and_text:
             audiopath, text, dv = record[:3]
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_and_text_new.append([audiopath, text, dv])
-                lengths.append(os.path.getsize(audiopath) // (3 * self.hop_length))
+                lengths.append(sf.info(audiopath).frames // self.hop_length)
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
 

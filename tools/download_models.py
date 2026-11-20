@@ -26,6 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REPO = "lj1995/VoiceConversionWebUI"
 DEFAULT_ENDPOINTS = ("https://huggingface.co", "https://hf-mirror.com")
 CHUNK = 1 << 20
+DOWNLOAD_LOCK = threading.Lock()
 
 
 class Asset:
@@ -138,6 +139,17 @@ def _fetch(url, destination, on_progress):
 
 
 def download_assets(assets, should_stop=None):
+    # Startup and one-click cloning may request the same files concurrently.
+    while not DOWNLOAD_LOCK.acquire(timeout=0.5):
+        if should_stop is not None and should_stop():
+            raise InterruptedError("stopped")
+    try:
+        yield from _download_assets(assets, should_stop)
+    finally:
+        DOWNLOAD_LOCK.release()
+
+
+def _download_assets(assets, should_stop=None):
     """Yield human readable progress lines while fetching the missing assets.
 
     Raises RuntimeError when a file cannot be fetched from any endpoint.
